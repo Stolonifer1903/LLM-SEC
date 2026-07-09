@@ -1,0 +1,20 @@
+# Discovery runtime (caches, logs, transient state)
+.discovery/logs/
+.discovery/runtime/
+.discovery/sessions/
+.discovery/toolcatalog/
+.discovery/host-tools/
+.discovery/bookshelf/*/extracted_content/
+.discovery/bookshelf/providers/
+.env
+llm-sec-env/
+.tmp-pycache/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated lab outputs
+zap_alerts.json
+evaluation_results.csv
