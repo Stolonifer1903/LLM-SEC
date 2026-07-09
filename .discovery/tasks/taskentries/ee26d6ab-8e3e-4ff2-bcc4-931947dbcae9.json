@@ -1,0 +1,17 @@
+{
+  "$schema": "2",
+  "name": "ee26d6ab-8e3e-4ff2-bcc4-931947dbcae9",
+  "dxId": "DX-14",
+  "title": "Document actionable guidance for using open-source LLMs in vulnerability triage",
+  "description": "Capture recommendations, prompt examples, and operational guidance for applying Ollama-based models in vulnerability scanner triage workflows.",
+  "status": "new",
+  "parentId": "a71b8c06-68f4-49a8-816b-bfdcb411fa8c",
+  "siblingOrder": 3,
+  "validationRequirements": [
+    "Prompt examples and configuration notes are documented",
+    "Practical limitations and caveats are recorded",
+    "A usage guide is prepared for integrating the workflow into security review"
+  ],
+  "createdAt": "2026-06-08T01:08:58.2797001+00:00",
+  "lastModifiedAt": "2026-06-08T01:08:58.2797001+00:00"
+}

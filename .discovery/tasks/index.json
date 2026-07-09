@@ -1,0 +1,135 @@
+{
+  "tasks": [
+    {
+      "taskId": "003fd511-aed0-4126-9979-707e9a68204a",
+      "dxId": "DX-4",
+      "title": "Set up Ollama and a reproducible prompt execution pipeline",
+      "status": "new",
+      "parentId": "98f53844-00b4-40dd-8643-ae5790cb1ed5",
+      "updatedAt": "2026-06-08T01:08:29.8929038+00:00"
+    },
+    {
+      "taskId": "02fa8ff0-496e-4cc3-ada7-047d77a35183",
+      "dxId": "DX-6",
+      "title": "Define and validate structured prompt engineering patterns that improve triage accuracy",
+      "status": "new",
+      "parentId": "a71b8c06-68f4-49a8-816b-bfdcb411fa8c",
+      "updatedAt": "2026-06-08T01:08:35.2106787+00:00"
+    },
+    {
+      "taskId": "16c14986-5cbd-421e-a0be-a726efe2b7bf",
+      "dxId": "DX-15",
+      "title": "Capture prompt examples, configuration notes, and limitations",
+      "status": "new",
+      "parentId": "ee26d6ab-8e3e-4ff2-bcc4-931947dbcae9",
+      "updatedAt": "2026-06-08T01:09:03.8008305+00:00"
+    },
+    {
+      "taskId": "5a9cfd0d-9110-42a7-9d9f-03b5a2661b32",
+      "dxId": "DX-10",
+      "title": "Compare model-generated vulnerability triage decisions to human or baseline assessments",
+      "status": "new",
+      "parentId": "a71b8c06-68f4-49a8-816b-bfdcb411fa8c",
+      "updatedAt": "2026-06-08T01:08:46.1002677+00:00"
+    },
+    {
+      "taskId": "6791406d-1e57-4742-b896-9975914bb01e",
+      "dxId": "DX-12",
+      "title": "Evaluate model outputs against the baseline using key metrics",
+      "status": "new",
+      "parentId": "5a9cfd0d-9110-42a7-9d9f-03b5a2661b32",
+      "updatedAt": "2026-06-08T01:08:52.6339825+00:00"
+    },
+    {
+      "taskId": "836a62bd-815e-4294-9f5f-05ea3180ce91",
+      "dxId": "DX-16",
+      "title": "Produce a usage guide for integrating the workflow into security review",
+      "status": "new",
+      "parentId": "ee26d6ab-8e3e-4ff2-bcc4-931947dbcae9",
+      "updatedAt": "2026-06-08T01:09:06.0464252+00:00"
+    },
+    {
+      "taskId": "87ce1763-d63f-4acc-9f16-d5f8752f589d",
+      "dxId": "DX-7",
+      "title": "Design prompt templates for classification, severity assessment, and remediation guidance",
+      "status": "new",
+      "parentId": "02fa8ff0-496e-4cc3-ada7-047d77a35183",
+      "updatedAt": "2026-06-08T01:08:37.5548861+00:00"
+    },
+    {
+      "taskId": "8c8788b9-d198-4282-8193-60483ac043f0",
+      "dxId": "DX-3",
+      "title": "Collect sample scanner findings and define input formats",
+      "status": "new",
+      "parentId": "98f53844-00b4-40dd-8643-ae5790cb1ed5",
+      "updatedAt": "2026-06-08T01:08:27.5297227+00:00"
+    },
+    {
+      "taskId": "98f53844-00b4-40dd-8643-ae5790cb1ed5",
+      "dxId": "DX-2",
+      "title": "Build an evaluation workflow for scanner finding triage",
+      "status": "new",
+      "parentId": "a71b8c06-68f4-49a8-816b-bfdcb411fa8c",
+      "updatedAt": "2026-06-08T01:08:25.202429+00:00"
+    },
+    {
+      "taskId": "a71b8c06-68f4-49a8-816b-bfdcb411fa8c",
+      "dxId": "DX-1",
+      "title": "Automate vulnerability scanner finding triage with open-source LLMs",
+      "status": "new",
+      "labels": [
+        "project-root"
+      ],
+      "updatedAt": "2026-06-08T01:08:22.9066962+00:00"
+    },
+    {
+      "taskId": "b8706426-855e-4a37-a4be-f90d09ada567",
+      "dxId": "DX-5",
+      "title": "Implement output parsing and structured triage decisions",
+      "status": "new",
+      "parentId": "98f53844-00b4-40dd-8643-ae5790cb1ed5",
+      "updatedAt": "2026-06-08T01:08:32.6244549+00:00"
+    },
+    {
+      "taskId": "d8459642-b133-4cf6-8021-2234c348db1f",
+      "dxId": "DX-11",
+      "title": "Choose a baseline triage method or human review process",
+      "status": "new",
+      "parentId": "5a9cfd0d-9110-42a7-9d9f-03b5a2661b32",
+      "updatedAt": "2026-06-08T01:08:50.0360105+00:00"
+    },
+    {
+      "taskId": "dd252fd4-f13d-4c60-b238-e337f0f83938",
+      "dxId": "DX-13",
+      "title": "Summarize strengths, weaknesses, and mismatch cases",
+      "status": "new",
+      "parentId": "5a9cfd0d-9110-42a7-9d9f-03b5a2661b32",
+      "updatedAt": "2026-06-08T01:08:54.9167133+00:00"
+    },
+    {
+      "taskId": "e74178ed-c03e-422b-b11e-d2fd27de0bca",
+      "dxId": "DX-9",
+      "title": "Identify prompt patterns that improve triage consistency and accuracy",
+      "status": "new",
+      "parentId": "02fa8ff0-496e-4cc3-ada7-047d77a35183",
+      "updatedAt": "2026-06-08T01:08:42.1824057+00:00"
+    },
+    {
+      "taskId": "ee26d6ab-8e3e-4ff2-bcc4-931947dbcae9",
+      "dxId": "DX-14",
+      "title": "Document actionable guidance for using open-source LLMs in vulnerability triage",
+      "status": "new",
+      "parentId": "a71b8c06-68f4-49a8-816b-bfdcb411fa8c",
+      "updatedAt": "2026-06-08T01:08:58.2797001+00:00"
+    },
+    {
+      "taskId": "f06478d1-3011-45ae-926e-5c666079cfcd",
+      "dxId": "DX-8",
+      "title": "Run prompt variations on sample findings and record model behavior",
+      "status": "new",
+      "parentId": "02fa8ff0-496e-4cc3-ada7-047d77a35183",
+      "updatedAt": "2026-06-08T01:08:39.91922+00:00"
+    }
+  ],
+  "rebuiltAt": "2026-06-29T12:35:59.2132231+00:00"
+}

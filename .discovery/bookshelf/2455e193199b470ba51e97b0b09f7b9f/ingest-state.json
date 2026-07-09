@@ -1,0 +1,97 @@
+{
+  "correlationId": "1cfc032c17cd4ce09b7cf1b8a945711e",
+  "status": "completed",
+  "startedAt": "2026-06-08T14:13:28.2553261+00:00",
+  "completedAt": "2026-06-08T14:14:08.6976923+00:00",
+  "sources": [
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\2312.12575v3.pdf",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\2501.18908v1.pdf",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\2509.15195v1.pdf",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\2509.15433v3.pdf",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\2510.18508v1.pdf",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\2510.20739v1.pdf",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\DPP_draft.docx",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\wiki\\new-folder-llm-triage-notes\\.wiki-meta.json",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\wiki\\new-folder-llm-triage-notes\\index.md",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\wiki\\new-folder-llm-triage-notes\\README.md",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\wiki\\new-folder-llm-triage-notes\\new-folder-llm-triage-notes\\INBOX.md",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\wiki\\new-folder-llm-triage-notes\\new-folder-llm-triage-notes\\overview.md",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    }
+  ],
+  "resolvedCount": 12,
+  "failedCount": 0,
+  "crackingFailureCount": 0,
+  "ingestFailureCount": 0,
+  "errors": []
+}

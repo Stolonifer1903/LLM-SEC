@@ -1,0 +1,14 @@
+{
+  "$schema": "2",
+  "name": "a71b8c06-68f4-49a8-816b-bfdcb411fa8c",
+  "dxId": "DX-1",
+  "title": "Automate vulnerability scanner finding triage with open-source LLMs",
+  "description": "Create a task tree for building and evaluating an Ollama-based vulnerability scanner triage workflow.",
+  "status": "new",
+  "siblingOrder": 0,
+  "labels": [
+    "project-root"
+  ],
+  "createdAt": "2026-06-08T01:08:22.9066962+00:00",
+  "lastModifiedAt": "2026-06-08T01:08:22.9066962+00:00"
+}

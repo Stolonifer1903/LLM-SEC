@@ -1,0 +1,27 @@
+{
+  "correlationId": "d824239116ee4e0b92376a7b0be58480",
+  "status": "completed",
+  "startedAt": "2026-06-08T01:06:11.8297419+00:00",
+  "completedAt": "2026-06-08T01:06:41.8872416+00:00",
+  "sources": [
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\2312.12575v3.pdf",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    },
+    {
+      "sourceType": "file",
+      "uri": "d:\\WebDev\\New folder\\knowledge\\2510.18508v1.pdf",
+      "status": "resolved",
+      "sourceId": null,
+      "error": null
+    }
+  ],
+  "resolvedCount": 2,
+  "failedCount": 0,
+  "crackingFailureCount": 0,
+  "ingestFailureCount": 0,
+  "errors": []
+}

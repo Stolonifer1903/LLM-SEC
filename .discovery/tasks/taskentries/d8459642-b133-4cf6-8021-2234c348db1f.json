@@ -1,0 +1,17 @@
+{
+  "$schema": "2",
+  "name": "d8459642-b133-4cf6-8021-2234c348db1f",
+  "dxId": "DX-11",
+  "title": "Choose a baseline triage method or human review process",
+  "description": "Select a reference process for comparison such as standard scanner categories, analyst review, or a known rule set.",
+  "status": "new",
+  "parentId": "5a9cfd0d-9110-42a7-9d9f-03b5a2661b32",
+  "siblingOrder": 0,
+  "validationRequirements": [
+    "A clear baseline or human review process is documented",
+    "Comparison criteria are defined",
+    "Reference data is prepared for evaluation"
+  ],
+  "createdAt": "2026-06-08T01:08:50.0360105+00:00",
+  "lastModifiedAt": "2026-06-08T01:08:50.0360105+00:00"
+}

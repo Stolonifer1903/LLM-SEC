@@ -1,0 +1,12 @@
+{
+  "outcomeId": "6a68a7f2ad9b420d87a153b3bfc67056",
+  "purposeId": "3104225128524b718094fa54dbf8eb20",
+  "title": "Define and validate structured prompt engineering patterns that improve triage accuracy.",
+  "description": "Develop prompt templates and test them against scanner findings to identify methods that increase correct classification and prioritization.",
+  "type": "artifact",
+  "verificationMode": "hybrid",
+  "status": "pending",
+  "createdAt": "2026-06-08T01:02:38.1853994+00:00",
+  "updatedAt": "2026-06-08T01:02:38.1853994+00:00",
+  "$schema": "2"
+}

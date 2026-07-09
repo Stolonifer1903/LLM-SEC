@@ -1,0 +1,17 @@
+{
+  "$schema": "2",
+  "name": "003fd511-aed0-4126-9979-707e9a68204a",
+  "dxId": "DX-4",
+  "title": "Set up Ollama and a reproducible prompt execution pipeline",
+  "description": "Configure Ollama and build an automated process for sending scanner findings to the model and capturing results.",
+  "status": "new",
+  "parentId": "98f53844-00b4-40dd-8643-ae5790cb1ed5",
+  "siblingOrder": 1,
+  "validationRequirements": [
+    "Ollama is installed and configured for local model use",
+    "A pipeline can send formatted input to the model and receive output",
+    "The prompt execution process is reproducible and documented"
+  ],
+  "createdAt": "2026-06-08T01:08:29.8929038+00:00",
+  "lastModifiedAt": "2026-06-08T01:08:29.8929038+00:00"
+}

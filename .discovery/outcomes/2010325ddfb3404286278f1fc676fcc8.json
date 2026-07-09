@@ -1,0 +1,12 @@
+{
+  "outcomeId": "2010325ddfb3404286278f1fc676fcc8",
+  "purposeId": "3104225128524b718094fa54dbf8eb20",
+  "title": "Document actionable guidance for using open-source LLMs in vulnerability triage.",
+  "description": "Produce practical recommendations, prompt examples, and limitations for applying Ollama-based models in scanner finding triage workflows.",
+  "type": "artifact",
+  "verificationMode": "hybrid",
+  "status": "pending",
+  "createdAt": "2026-06-08T01:02:42.1589685+00:00",
+  "updatedAt": "2026-06-08T01:02:42.1589685+00:00",
+  "$schema": "2"
+}

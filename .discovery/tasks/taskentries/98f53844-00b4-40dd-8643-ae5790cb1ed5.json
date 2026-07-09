@@ -1,0 +1,17 @@
+{
+  "$schema": "2",
+  "name": "98f53844-00b4-40dd-8643-ae5790cb1ed5",
+  "dxId": "DX-2",
+  "title": "Build an evaluation workflow for scanner finding triage",
+  "description": "Collect scanner output, configure Ollama, and implement structured prompt execution with parsed triage decisions.",
+  "status": "new",
+  "parentId": "a71b8c06-68f4-49a8-816b-bfdcb411fa8c",
+  "siblingOrder": 0,
+  "validationRequirements": [
+    "Sample scanner findings are collected and normalized into a consistent input schema",
+    "Ollama is configured and able to execute prompts against selected open-source models",
+    "Model outputs are parsed into structured triage fields such as issue type, severity, and recommendation"
+  ],
+  "createdAt": "2026-06-08T01:08:25.202429+00:00",
+  "lastModifiedAt": "2026-06-08T01:08:25.202429+00:00"
+}
