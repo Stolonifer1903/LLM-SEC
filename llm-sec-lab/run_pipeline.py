@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from pydantic import BaseModel, Field
+
 
 from zap_scanner import wait_for_zap, run_scan, save_alerts
 from evaluator import (
@@ -24,36 +24,125 @@ ALERTS_FILE = "zap_alerts.json"
 GT_FILE = "ground_truth.csv"
 
 # --- LLM SETUP ---
-class VulnAssessment(BaseModel):
-    is_vulnerability: bool = Field(description="True if this is a confirmed vulnerability")
-    vulnerability_type: str = Field(description="Type e.g. SQLi, XSS, CSRF, Command Injection, etc.")
-    cwe_id: str = Field(description="Most likely CWE ID e.g. CWE-89")
-    owasp_category: str = Field(description="OWASP Top 10 category e.g. A03:2021")
-    severity: str = Field(description="Critical / High / Medium / Low / Informational")
-    confidence: str = Field(description="High / Medium / Low")
-    reasoning: str = Field(description="Brief explanation of your reasoning")
-    false_positive: bool = Field(description="True if you think this is a false positive")
 
 PROMPT_STRATEGIES = {
     "zero_shot": ChatPromptTemplate.from_messages([
         ("system", "You are a web app security expert. Analyse the ZAP scanner alert and return a JSON assessment."),
         ("human", "Alert:\nName: {alert_name}\nRisk: {risk}\nConfidence: {confidence}\nURL: {url}\nDescription: {description}\nEvidence: {evidence}\n\nReturn JSON with: is_vulnerability, vulnerability_type, cwe_id, owasp_category, severity, confidence, reasoning, false_positive")
     ]),
+
+    "few_shot": ChatPromptTemplate.from_messages([
+        ("system", "You are a web app security expert. Use the labelled examples to guide your JSON assessment."),
+        ("human", """Examples:
+
+Example 1
+Alert:
+Name: SQL Injection
+Risk: High
+Confidence: High
+URL: /product?id=1
+Description: SQL syntax error triggered by quote input
+Evidence: database error near "'"
+Output:
+{{"is_vulnerability": true, "vulnerability_type": "SQL Injection", "cwe_id": "CWE-89", "owasp_category": "A03:2021 Injection", "severity": "High", "confidence": "High", "reasoning": "Database error after SQL metacharacter suggests exploitable SQL injection.", "false_positive": false}}
+
+Example 2
+Alert:
+Name: Timestamp Disclosure - Unix
+Risk: Low
+Confidence: Low
+URL: /assets/app.js
+Description: Unix timestamp disclosed in static asset
+Evidence: 1666666667
+Output:
+{{"is_vulnerability": false, "vulnerability_type": "Information Disclosure", "cwe_id": "CWE-497", "owasp_category": "A01:2021 Broken Access Control", "severity": "Low", "confidence": "Low", "reasoning": "A build timestamp in a static file is usually not exploitable and is likely a false positive.", "false_positive": true}}
+
+Now assess this alert:
+Name: {alert_name}
+Risk: {risk}
+Confidence: {confidence}
+URL: {url}
+Description: {description}
+Evidence: {evidence}
+
+Return JSON with: is_vulnerability, vulnerability_type, cwe_id, owasp_category, severity, confidence, reasoning, false_positive""")
+    ]),
+
     "chain_of_thought": ChatPromptTemplate.from_messages([
         ("system", "You are a web app security expert. Think step by step before classifying."),
-        ("human", "Analyse this ZAP scanner alert step by step.\n\nAlert: {alert_name}\nRisk: {risk}\nConfidence: {confidence}\nURL: {url}\nDescription: {description}\nEvidence: {evidence}\n\nStep 1: What type of vulnerability is this?\nStep 2: Could this be a false positive?\nStep 3: What CWE applies?\nStep 4: Final JSON with: is_vulnerability, vulnerability_type, cwe_id, owasp_category, severity, confidence, reasoning, false_positive")
+        ("human", """Analyse this ZAP scanner alert step by step.
+
+Alert: {alert_name}
+Risk: {risk}
+Confidence: {confidence}
+URL: {url}
+Description: {description}
+Evidence: {evidence}
+
+Step 1: What type of vulnerability is this?
+Step 2: Could this be a false positive?
+Step 3: What CWE applies?
+Step 4: Before finalising, verify your reasoning contains no logical contradictions or unsupported inferences.
+Step 5: Final JSON with: is_vulnerability, vulnerability_type, cwe_id, owasp_category, severity, confidence, reasoning, false_positive""")
     ])
 }
 
-def assess_alert(alert: dict, strategy: str) -> dict:
-    llm = ChatNVIDIA(model=MODEL, api_key=os.environ["NVIDIA_API_KEY"], temperature=0.0, max_tokens=1024)
+def safe_parse_json(raw_output: str):
+    try:
+        return json.loads(raw_output), False, None
+    except Exception:
+        pass
+
+    fenced = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw_output, re.DOTALL)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1)), False, None
+        except Exception:
+            pass
+
+    loose = re.search(r'\{.*\}', raw_output, re.DOTALL)
+    if loose:
+        try:
+            return json.loads(loose.group()), False, None
+        except Exception as e:
+            return None, True, str(e)
+
+    return None, True, "No JSON object found"
+
+
+llm = ChatNVIDIA(
+    model=MODEL,
+    api_key=os.environ["NVIDIA_API_KEY"],
+    temperature=0.0,
+    max_completion_tokens=1024
+)
+
+def assess_alert(alert: dict, strategy: str, cache: dict = None) -> dict:
+    if cache is not None:
+        key = (strategy, alert.get("app"), alert.get("alert_name"), alert.get("risk"), alert.get("confidence"), alert.get("description"))
+        if key in cache:
+            return dict(cache[key])
+
     chain = PROMPT_STRATEGIES[strategy] | llm | StrOutputParser()
     raw_output = chain.invoke(alert)
-    json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)
-    if json_match:
-        try: return json.loads(json_match.group())
-        except json.JSONDecodeError: pass
-    return {"raw_output": raw_output, "parse_error": True}
+    parsed, parse_failed, parse_error = safe_parse_json(raw_output)
+
+    if parsed is not None:
+        parsed["raw_output"] = raw_output
+        parsed["parse_error"] = False
+        parsed["json_parsed"] = True
+        if cache is not None:
+            cache[key] = parsed
+        return parsed
+
+    res = {
+        "raw_output": raw_output,
+        "parse_error": parse_error,
+        "json_parsed": False
+    }
+    if cache is not None:
+        cache[key] = res
+    return res
 
 # --- PIPELINE RUNNER ---
 def main():
@@ -68,11 +157,13 @@ def main():
         with open(ALERTS_FILE) as f:
             alerts = json.load(f)
 
+    # Use cache to avoid redundant API queries for identical alerts (ignoring URLs)
+    cache = {}
     results_by_strategy = {s: [] for s in PROMPT_STRATEGIES.keys()}
     for i, alert in enumerate(alerts):
-        print(f"Processing alert {i+1}/{len(alerts)}: {alert['alert_name'][:50]}")
+        print(f"Processing alert {i+1}/{len(alerts)}: {alert['alert_name'][:50]}", flush=True)
         for strategy in PROMPT_STRATEGIES.keys():
-            llm_output = assess_alert(alert, strategy)
+            llm_output = assess_alert(alert, strategy, cache)
             results_by_strategy[strategy].append({"alert": alert, "llm_output": llm_output, "strategy": strategy})
 
     gt = load_ground_truth(GT_FILE)
@@ -80,19 +171,24 @@ def main():
     for strategy, results in results_by_strategy.items():
         rows = [match_alert_to_ground_truth(r["alert"], r["llm_output"], gt) for r in results]
         df = pd.DataFrame(rows)
+        parse_rate = df["json_parsed"].mean() if "json_parsed" in df.columns else None
+        if parse_rate is not None:
+            print(f"  Parse success rate: {parse_rate:.3f}", flush=True)
+            if parse_rate < 0.80:
+                print("  WARNING: parse failure rate > 20% (methodology concern)", flush=True)
         dfs[strategy] = df
         metrics = compute_metrics(df)
         fn = find_false_negatives(df, gt)
-        print(f"\n── {strategy.upper()} ──")
-        print(f"  Precision: {metrics['precision']:.3f} | Recall: {metrics['recall']:.3f} | F1: {metrics['f1']:.3f} | Kappa: {metrics['kappa']:.3f}")
-        print(f"  Missed ground-truth vulns (False Negatives): {len(fn)}")
+        print(f"\n=== {strategy.upper()} ===", flush=True)
+        print(f"  Precision: {metrics['precision']:.3f} | Recall: {metrics['recall']:.3f} | F1: {metrics['f1']:.3f} | Kappa: {metrics['kappa']:.3f}", flush=True)
+        print(f"  Missed ground-truth vulns (False Negatives): {len(fn)}", flush=True)
 
-    print("\n── McNemar Test (zero_shot vs chain_of_thought) ──")
+    print("\n=== McNemar Test (zero_shot vs chain_of_thought) ===", flush=True)
     mc = mcnemar_test(dfs["zero_shot"], dfs["chain_of_thought"])
-    print(f"  p-value: {mc['p_value']:.4f}")
+    print(f"  p-value: {mc['p_value']:.4f}", flush=True)
 
     pd.concat(dfs.values()).to_csv("evaluation_results.csv", index=False)
-    print("\nResults saved to evaluation_results.csv")
+    print("\nResults saved to evaluation_results.csv", flush=True)
 
 if __name__ == "__main__":
     main()

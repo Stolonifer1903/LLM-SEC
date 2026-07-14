@@ -37,6 +37,7 @@ def match_alert_to_ground_truth(alert: dict, llm_output: dict, gt: pd.DataFrame)
         "matched_challenge_id": matched_challenge_id,
         "false_positive": llm_output.get("false_positive", False),
         "llm_confidence": llm_output.get("confidence"),
+        "json_parsed": llm_output.get("json_parsed", False),
         "reasoning": llm_output.get("reasoning", "")
     }
 

@@ -4,8 +4,8 @@ import requests
 
 ZAP_BASE_URL = 'http://localhost:8090'
 ZAP_API_BASE = f'{ZAP_BASE_URL}/JSON'
-API_TIMEOUT = (5, 20)
-MAX_STATUS_TIMEOUTS = 12
+API_TIMEOUT = (3, 5)
+MAX_STATUS_TIMEOUTS = 120
 
 session = requests.Session()
 session.trust_env = False
@@ -16,7 +16,14 @@ def zap_api(component: str, kind: str, name: str, **params):
     response.raise_for_status()
     return response.json()
 
+def configure_active_scan() -> None:
+    zap_api("ascan", "action", "setOptionThreadPerHost", Integer=1)
+    zap_api("ascan", "action", "setOptionMaxRuleDurationInMins", Integer=2)
+    zap_api("ascan", "action", "setOptionMaxScanDurationInMins", Integer=15)
+    zap_api("ascan", "action", "setOptionMaxAlertsPerRule", Integer=5)
+
 def wait_for_progress(get_status, scan_id: str, label: str, poll_seconds: int) -> None:
+    start = time.time()
     timeout_count = 0
     while True:
         try:
@@ -26,7 +33,8 @@ def wait_for_progress(get_status, scan_id: str, label: str, poll_seconds: int) -
             timeout_count += 1
             if timeout_count > MAX_STATUS_TIMEOUTS:
                 raise RuntimeError(f"{label} status did not respond after {MAX_STATUS_TIMEOUTS} retries") from exc
-            print(f"  {label} status temporarily unavailable; retrying ({timeout_count}/{MAX_STATUS_TIMEOUTS})", end="\r")
+            elapsed_minutes = (time.time() - start) / 60
+            print(f"  {label} status unavailable; retrying ({timeout_count}/{MAX_STATUS_TIMEOUTS}) after {elapsed_minutes:.1f} min", end="\r")
             time.sleep(poll_seconds)
             continue
         if not str(status).isdigit():
@@ -34,7 +42,8 @@ def wait_for_progress(get_status, scan_id: str, label: str, poll_seconds: int) -
         progress = int(status)
         if progress >= 100:
             return
-        print(f"  {label} progress: {progress}%", end="\r")
+        elapsed_minutes = (time.time() - start) / 60
+        print(f"  {label} progress: {progress}% after {elapsed_minutes:.1f} min", end="\r")
         time.sleep(poll_seconds)
 
 def wait_for_zap(timeout=60):
@@ -63,6 +72,7 @@ def run_scan(target_url: str, scan_label: str) -> list[dict]:
     print(f"[{scan_label}] Spider complete.")
 
     print(f"[{scan_label}] Starting active scan on {target_url}")
+    configure_active_scan()
     ascan_id = zap_api("ascan", "action", "scan", url=target_url)["scan"]
     wait_for_progress(
         lambda scan_id: zap_api("ascan", "view", "status", scanId=scan_id)["status"],
