@@ -44,23 +44,15 @@ cd "D:\WebDev\New folder"
 
 From the repository root:
 
-### Windows PowerShell
+### Windows Git Bash
 
-```powershell
+```bash
 cd llm-sec-lab
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/Scripts/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
-
-If PowerShell blocks activation, run:
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-Then activate the environment again.
 
 ### macOS / Linux
 
