@@ -7,6 +7,8 @@
 .discovery/bookshelf/*/extracted_content/
 .discovery/bookshelf/providers/
 .env
+.venv/
+llm-sec-lab/.venv/
 llm-sec-env/
 .tmp-pycache/
 
@@ -18,3 +20,6 @@ __pycache__/
 # Generated lab outputs
 zap_alerts.json
 evaluation_results.csv
+evaluation_results_*.csv
+pipeline_results.json
+pipeline_results_*.json

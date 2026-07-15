@@ -4,4 +4,5 @@ requests
 langchain-core
 langchain-nvidia-ai-endpoints
 scikit-learn
+scipy
 statsmodels
