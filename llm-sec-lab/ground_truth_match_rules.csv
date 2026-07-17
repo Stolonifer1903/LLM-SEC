@@ -1,0 +1,3 @@
+rule_id,app,zap_alert_name,zap_cwe_id,url_regex,evidence_regex,ground_truth_label,challenge_ids,rationale
+juice_timestamp_without_cve,juice_shop,Timestamp Disclosure - Unix,CWE-497,,,NOT_VULNERABLE,,"Timestamp disclosure is informational without version-specific CVE evidence."
+juice_cors_wildcard_without_exposure,juice_shop,Cross-Domain Misconfiguration,CWE-264,,"access-control-allow-origin:\s*\*(?!.*access-control-allow-credentials:\s*true)",NOT_VULNERABLE,,"A wildcard origin alone does not demonstrate credential exposure or sensitive cross-origin data leakage."

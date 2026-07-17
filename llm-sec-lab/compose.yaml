@@ -7,6 +7,9 @@ services:
   juice-shop:
     image: bkimminich/juice-shop
     container_name: juice-shop
+    restart: unless-stopped
+    environment:
+      NODE_OPTIONS: --max-old-space-size=4096
     ports:
       - "3000:3000"
     networks:
@@ -17,14 +20,6 @@ services:
     container_name: dvwa
     ports:
       - "8081:80"
-    networks:
-      - lab-net
-
-  webgoat:
-    image: webgoat/webgoat
-    container_name: webgoat
-    ports:
-      - "8080:8080"
     networks:
       - lab-net
 
@@ -45,4 +40,3 @@ services:
     depends_on:
       - juice-shop
       - dvwa
-      - webgoat

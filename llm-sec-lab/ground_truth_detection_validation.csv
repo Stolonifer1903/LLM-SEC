@@ -1,0 +1,5 @@
+provider_key,app,current_detection_mode,validation_status,validated_detection_mode,zap_alert_name,zap_cwe_id,url_regex,evidence_regex,scan_profile,validation_run_id,rationale
+dbSchemaChallenge,juice_shop,zap_active,candidate,,SQL Injection,CWE-89,^/rest/products/search$,HTTP/1\.1 500 Internal Server Error,baseline,20260717T190321Z,Single baseline observation; repeat targeted validation is required before accepting the product-search SQL injection as a primary positive.
+DVWA-FI,dvwa,manual,candidate,,Path Traversal,CWE-22,^/vulnerabilities/fi$,root:x:0:0,baseline,20260717T190321Z,Single observation of /etc/passwd disclosure; repeat targeted validation is required and the observed ZAP CWE is retained.
+DVWA-CSRF,dvwa,manual,supporting_only,,Absence of Anti-CSRF Tokens,CWE-352,^/vulnerabilities/csrf$,,baseline,20260717T190321Z,Missing-token evidence supports review but does not prove a cross-origin state-changing exploit.
+DVWA-CSP,dvwa,manual,supporting_only,,Content Security Policy (CSP) Header Not Set,CWE-693,^/vulnerabilities/csp$,,baseline,20260717T190321Z,CSP weakness is supporting evidence only; a bypass and resulting exploit must be demonstrated.

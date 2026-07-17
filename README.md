@@ -5,16 +5,17 @@ This repository contains a small research workspace for evaluating whether LLMs 
 ## Repository Layout
 
 - `llm-sec-lab/` - Runnable security triage lab.
-  - `compose.yaml` - Docker Compose stack for OWASP Juice Shop, DVWA, WebGoat, and OWASP ZAP.
-  - `zap_scanner.py` - Starts ZAP spider and active scans against each target, then saves normalized alerts.
+  - `compose.yaml` - Docker Compose stack for OWASP Juice Shop, DVWA, and OWASP ZAP.
+  - `zap_scanner.py` - Runs scoped DAST workflows: traditional discovery, AJAX discovery for Juice Shop, authenticated DVWA scanning, baseline or targeted active rules, coverage validation, and report generation.
   - `run_pipeline.py` - Runs scans or loads cached alerts, asks the configured NVIDIA-hosted open-weight model to classify each alert, and writes evaluation results.
   - `evaluator.py` - Matches LLM classifications to ground-truth labels and calculates precision, recall, F1, Cohen kappa, false negatives, and McNemar comparison.
   - `ground_truth.csv` - Expected vulnerability labels used by the evaluator.
+  - `ground_truth_detection_validation.csv` - Review overlay that records whether catalogue challenges have been reproducibly validated as ZAP-detectable.
   - `requirements.txt` - Python dependencies for the lab runner.
 - `knowledge/` - Research papers, notes, draft material, and a wiki for the LLM triage project.
 - `.discovery/` and `.github/` - Workspace metadata, agent guidance, task state, and Copilot/Discovery configuration.
 
-Generated files such as `.env`, `zap_alerts.json`, `evaluation_results.csv`, virtual environments, bytecode caches, and Discovery runtime indexes are ignored by Git.
+Generated files such as `.env`, `zap_alerts.json`, timestamped `results/` artifacts, virtual environments, bytecode caches, and Discovery runtime indexes are ignored by Git.
 
 ## Prerequisites
 
@@ -100,7 +101,6 @@ Local service URLs:
 
 - Juice Shop: `http://localhost:3000`
 - DVWA: `http://localhost:8081`
-- WebGoat: `http://localhost:8080/WebGoat`
 - ZAP API: `http://localhost:8090`
 
 The scanner code runs from your host and reaches ZAP at `localhost:8090`. ZAP reaches the vulnerable apps by Docker service names such as `http://juice-shop:3000`.
@@ -110,22 +110,34 @@ The scanner code runs from your host and reaches ZAP at `localhost:8090`. ZAP re
 From `llm-sec-lab/` with the Python environment activated:
 
 ```bash
-python run_pipeline.py --scan
+python run_pipeline.py --scan --scan-profile baseline
 ```
 
-This waits for ZAP, scans Juice Shop, DVWA, and WebGoat, saves `zap_alerts.json`, runs all prompt strategies, evaluates them against `ground_truth.csv`, and writes `evaluation_results.csv`.
+This waits for ZAP, resets DVWA's local lab database, scans Juice Shop and DVWA, saves `zap_alerts.json`, runs all prompt strategies, and evaluates them against the explicit crosswalk rules. The DAST workflow uses traditional crawling plus the AJAX spider for Juice Shop, an authenticated DVWA user, uncapped active-scan duration and per-rule alert limits, and refuses to continue when required application routes were not discovered. Each run writes timestamped artifacts to `results/pipeline/`, `results/evaluation/`, `results/audit/`, `results/statistics/`, `results/summary/`, `results/unmapped/`, and `results/scan/`. The scan artifact records the effective configuration, discovered URLs, alert-family counts, raw findings, and a quality-oriented summary.
 
-To reuse existing ZAP alerts and only rerun LLM evaluation:
+For targeted triage validation, use a separate profile:
+
+```bash
+python run_pipeline.py --scan --scan-profile targeted
+```
+
+Targeted runs use reproducible DVWA form/API seeds, raise attack strength for injection/XSS/path-traversal/redirect rules, and disable the noisy User Agent Fuzzer rule. Baseline and targeted artifacts must not be pooled; each profile retains its own paired strategy analysis.
+
+To reuse existing in-scope ZAP alerts and only rerun LLM evaluation:
 
 ```bash
 python run_pipeline.py
 ```
 
+Cached alert files containing a retired target such as WebGoat are rejected. Run `python run_pipeline.py --scan` to create a fresh two-app alert set.
+
+The current two-app crosswalk contains defensible negative rules only. A run therefore writes its inference, audit, unmapped-alert, and coverage-summary artifacts, then blocks metric and statistical output until a defensible Juice Shop or DVWA positive rule is added. Positive rules must correspond to a `validated` entry in `ground_truth_detection_validation.csv`; candidate and supporting-only entries are never treated as positives. Earlier three-app artifacts are historical and must not be compared directly with two-app runs.
+
 The pipeline currently compares:
 
 - `zero_shot` - Direct JSON-only vulnerability assessment.
 - `few_shot` - JSON assessment guided by labelled examples.
-- `chain_of_thought` - Stepwise assessment followed by final JSON and a reasoning consistency check.
+- `cot` - Stepwise assessment followed by final JSON and a reasoning consistency check.
 
 ## Stop The Lab Services
 
@@ -142,14 +154,14 @@ If you want to remove downloaded container data and images, use Docker Desktop o
 - `NVIDIA_API_KEY` missing: confirm `llm-sec-lab/.env` exists and that you run the Python command from `llm-sec-lab/`.
 - Docker cannot pull images: confirm Docker is running and the machine has internet access.
 - ZAP does not respond: run `docker compose ps` and inspect logs with `docker compose logs zap`.
-- DVWA/WebGoat/Juice Shop unavailable from the browser: check the local port mappings in `compose.yaml`.
-- Slow scans: active scan rules are capped in `zap_scanner.py`, but WebGoat and DVWA can still take time depending on CPU and Docker resources.
+- DVWA/Juice Shop unavailable from the browser: check the local port mappings in `compose.yaml`.
+- Thorough scans can take a substantial amount of time: active scan rule duration, total duration, and per-rule alert counts are intentionally uncapped. The AJAX spider is capped at 20 minutes by default (`ZAP_AJAX_MAX_DURATION_MINS`) so a browser crawl cannot run indefinitely; tune this only when necessary.
 
 ## Typical Workflow
 
 1. Start Docker services with `docker compose up -d`.
 2. Run `python run_pipeline.py --scan` for a fresh scan and evaluation.
-3. Inspect `zap_alerts.json` and `evaluation_results.csv`.
+3. Inspect `zap_alerts.json` and the timestamped artifacts under `results/`.
 4. Adjust prompt strategies or model settings in `run_pipeline.py`.
 5. Rerun `python run_pipeline.py` to reuse cached alerts while testing prompt changes.
 6. Shut down services with `docker compose down`.
