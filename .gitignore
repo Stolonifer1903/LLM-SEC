@@ -11,6 +11,7 @@
 llm-sec-lab/.venv/
 llm-sec-env/
 .tmp-pycache/
+.firecrawl/
 
 # Python caches
 __pycache__/
@@ -32,3 +33,5 @@ evaluation_summary.json
 evaluation_summary_*.json
 unmapped_alerts.json
 unmapped_alerts_*.json
+
+VulnerableApp-master/

@@ -39,7 +39,7 @@ Availability was last checked against the NVIDIA API Catalog on **2026-07-16**. 
 
 Add one row after each completed model run. Do not compare rows unless the ZAP alert set, prompt strategies, temperature, ground-truth rules, and evaluator version were held constant.
 
-The active study scope is OWASP Juice Shop and DVWA. Results from earlier three-app runs that included WebGoat are historical artifacts and are not comparable with new two-app runs.
+The active study scope is OWASP Juice Shop and OWASP VulnerableApp. Results from earlier multi-app runs are historical artifacts and are not comparable with new two-app runs.
 
 | Experiment | Date | NIM model ID | Temperature | Alert count | Prompt strategies | Result file or notes |
 |---|---|---|---:|---:|---|---|
