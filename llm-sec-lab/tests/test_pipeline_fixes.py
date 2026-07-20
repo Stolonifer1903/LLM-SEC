@@ -49,8 +49,20 @@ EVALUATION_COLUMNS = [
 
 
 def load_alerts():
-    with open(LAB_DIR / "zap_alerts.json", encoding="utf-8") as file:
-        return json.load(file)
+    return [
+        {
+            "app": "juice_shop", "alert_name": "Timestamp Disclosure - Unix",
+            "cweid": "497", "risk": "Low", "confidence": "Low",
+            "url": "http://juice-shop:3000/app.js", "description": "timestamp",
+            "evidence": "1700000000",
+        },
+        {
+            "app": "juice_shop", "alert_name": "Content Security Policy (CSP) Header Not Set",
+            "cweid": "693", "risk": "Medium", "confidence": "Medium",
+            "url": "http://juice-shop:3000/", "description": "header missing",
+            "evidence": "",
+        },
+    ]
 
 
 def prepared_alert(alert, alert_id):
@@ -165,12 +177,12 @@ class DedupAndInferenceTests(unittest.TestCase):
 
     def test_missing_cluster_result_fails_reexpansion(self):
         alert = prepared_alert({
-            "app": "dvwa",
+            "app": "vulnerable_app",
             "alert_name": "SQL Injection",
             "cweid": "89",
             "risk": "High",
             "confidence": "High",
-            "url": "http://dvwa/vulnerabilities/sqli/",
+            "url": "http://vulnerable-app:9090/VulnerableApp/SQLInjectionVulnerability/LEVEL_1",
             "description": "SQL injection",
             "evidence": "error",
         }, 0)
@@ -321,12 +333,12 @@ class DedupAndInferenceTests(unittest.TestCase):
 
     def test_permanent_nim_failure_is_not_retried(self):
         alert = prepared_alert({
-            "app": "dvwa",
+            "app": "vulnerable_app",
             "alert_name": "SQL Injection",
             "cweid": "89",
             "risk": "High",
             "confidence": "High",
-            "url": "http://dvwa/vulnerabilities/sqli/",
+            "url": "http://vulnerable-app:9090/VulnerableApp/SQLInjectionVulnerability/LEVEL_1",
             "description": "SQL injection",
             "evidence": "error",
         }, 0)
@@ -396,7 +408,7 @@ class EvaluationObservabilityTests(unittest.TestCase):
             with open(ground_truth_path, "w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
                 writer.writerow(["app", "provider_key", "ground_truth_label"])
-                writer.writerow(["dvwa", "DVWA-SQLI", "VULNERABLE"])
+                writer.writerow(["vulnerable_app", "VULNERABLE_APP-SQLI", "VULNERABLE"])
             with open(rules_path, "w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
                 writer.writerow([
@@ -404,8 +416,8 @@ class EvaluationObservabilityTests(unittest.TestCase):
                     "evidence_regex", "ground_truth_label", "challenge_ids", "rationale",
                 ])
                 writer.writerow([
-                    "dvwa_sqli", "dvwa", "SQL Injection", "CWE-89", "^/vulnerabilities/sqli$",
-                    "", "VULNERABLE", "DVWA-SQLI", "Controlled positive fixture.",
+                    "vulnerable_app_sqli", "vulnerable_app", "SQL Injection", "CWE-89", "^/VulnerableApp/SQLInjectionVulnerability/LEVEL_1$",
+                    "", "VULNERABLE", "VULNERABLE_APP-SQLI", "Controlled positive fixture.",
                 ])
                 writer.writerow([
                     "juice_timestamp", "juice_shop", "Timestamp Disclosure - Unix", "CWE-497",
@@ -413,9 +425,9 @@ class EvaluationObservabilityTests(unittest.TestCase):
                 ])
 
             positive = prepared_alert({
-                "app": "dvwa", "alert_name": "SQL Injection", "cweid": "89",
+                "app": "vulnerable_app", "alert_name": "SQL Injection", "cweid": "89",
                 "risk": "High", "confidence": "High",
-                "url": "http://dvwa/vulnerabilities/sqli/", "description": "SQL error",
+                "url": "http://vulnerable-app:9090/VulnerableApp/SQLInjectionVulnerability/LEVEL_1", "description": "SQL error",
                 "evidence": "database error", "pluginid": "40018",
             }, 0)
             negatives = [prepared_alert({

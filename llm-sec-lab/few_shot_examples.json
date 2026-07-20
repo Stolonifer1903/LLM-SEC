@@ -1,0 +1,54 @@
+[
+  {
+    "alert_name": "SQL Injection",
+    "risk": "High",
+    "url": "https://training.example.invalid/catalog/search?q=test%27",
+    "description": "A database error was returned after a SQL metacharacter was submitted.",
+    "evidence": "HTTP 500 response contains SQL syntax error near unexpected token.",
+    "confirmed": true,
+    "confidence": 0.94,
+    "severity": "High",
+    "recommended_action": "Escalate for immediate remediation and confirm parameterized queries.",
+    "source_title": "OWASP ZAP active scan rule documentation",
+    "source_url": "https://www.zaproxy.org/docs/desktop/addons/active-scan-rules/"
+  },
+  {
+    "alert_name": "Path Traversal",
+    "risk": "High",
+    "url": "https://training.example.invalid/download?file=../../etc/passwd",
+    "description": "The application returned content from an operating-system file after traversal input.",
+    "evidence": "root:x:0:0:root:/root:/bin/bash",
+    "confirmed": true,
+    "confidence": 0.98,
+    "severity": "High",
+    "recommended_action": "Escalate and restrict file access to an allow-listed server-side directory.",
+    "source_title": "OWASP ZAP active scan rule documentation",
+    "source_url": "https://www.zaproxy.org/docs/desktop/addons/active-scan-rules/"
+  },
+  {
+    "alert_name": "Timestamp Disclosure - Unix",
+    "risk": "Low",
+    "url": "https://training.example.invalid/assets/app.js",
+    "description": "A response contains a build timestamp.",
+    "evidence": "Last modified: 1700000000",
+    "confirmed": false,
+    "confidence": 0.12,
+    "severity": "Informational",
+    "recommended_action": "Dismiss unless separate version-specific exploit evidence is available.",
+    "source_title": "OWASP ZAP passive scan rule documentation",
+    "source_url": "https://www.zaproxy.org/docs/desktop/addons/passive-scan-rules/"
+  },
+  {
+    "alert_name": "Cross-Domain Misconfiguration",
+    "risk": "Medium",
+    "url": "https://training.example.invalid/public/status",
+    "description": "The response allows a wildcard cross-origin origin for an unauthenticated public endpoint.",
+    "evidence": "Access-Control-Allow-Origin: *",
+    "confirmed": false,
+    "confidence": 0.16,
+    "severity": "Low",
+    "recommended_action": "Investigate only if credentials or sensitive cross-origin data exposure is demonstrated.",
+    "source_title": "OWASP ZAP passive scan rule documentation",
+    "source_url": "https://www.zaproxy.org/docs/desktop/addons/passive-scan-rules/"
+  }
+]

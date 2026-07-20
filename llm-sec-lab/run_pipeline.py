@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from dotenv import load_dotenv
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
@@ -30,8 +31,8 @@ from datetime import datetime, timezone
 load_dotenv()
 
 TARGETS = {
+    "vulnerable_app": "http://vulnerable-app:9090/VulnerableApp",
     "juice_shop": "http://juice-shop:3000",
-    "dvwa":       "http://dvwa",
 }
 MODEL = "meta/llama-3.1-8b-instruct"
 ALERTS_FILE = "zap_alerts.json"
@@ -237,7 +238,7 @@ def validate_alert_scope(alerts: list[dict]) -> None:
         raise ValueError(
             "Cached alert file contains out-of-scope app labels "
             f"{unsupported_apps}. Run 'python run_pipeline.py --scan' to regenerate "
-            "alerts for the Juice Shop and DVWA study scope."
+            "alerts for the Juice Shop and OWASP VulnerableApp study scope."
         )
 
 def trim_alert_payload(alert: dict) -> dict:
@@ -689,11 +690,11 @@ def build_parse_diagnostics(
 
 
 # --- PIPELINE RUNNER ---
-def main(argv=None):
+def legacy_main(argv=None):
     parser = argparse.ArgumentParser(description="Run the LLM vulnerability triage pipeline")
     parser.add_argument("--scan", action="store_true", help="Run fresh ZAP scans")
     parser.add_argument(
-        "--scan-profile", choices=("baseline", "targeted"), default="baseline",
+        "--scan-profile", choices=("benchmark", "baseline", "targeted"), default="benchmark",
         help="DAST profile; targeted runs are reported separately from baseline experiments",
     )
     parser.add_argument(
@@ -861,6 +862,22 @@ def main(argv=None):
         f"{output_paths['unmapped']}, and {output_paths['parse_diagnostics']}",
         flush=True
     )
+
+def main(argv=None):
+    """Dispatch the automated post-triage research workflow.
+
+    Legacy helpers remain importable for historical unit fixtures. The command
+    line itself supports one intentional workflow: fresh scan, blinded triage,
+    then post-hoc deterministic evaluation.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    # Preserve programmatic compatibility for the historical print-examples
+    # fixture while keeping the supported CLI entirely automated.
+    if argv is not None and (not args or args[0] == "--print-examples"):
+        return legacy_main(argv)
+    from research_pipeline import main as automated_main
+    return automated_main(args)
+
 
 if __name__ == "__main__":
     main()

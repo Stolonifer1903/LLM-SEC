@@ -33,8 +33,8 @@ class FakePromptChain:
 
 
 class PromptAndStrategyTests(unittest.TestCase):
-    def test_scan_target_list_is_webgoat_free(self):
-        self.assertEqual(set(run_pipeline.TARGETS), {"juice_shop", "dvwa"})
+    def test_scan_target_list_uses_vulnerable_app(self):
+        self.assertEqual(set(run_pipeline.TARGETS), {"juice_shop", "vulnerable_app"})
         self.assertNotIn("webgoat", run_pipeline.TARGETS)
 
     def test_strategy_set_and_confidence_instructions(self):
