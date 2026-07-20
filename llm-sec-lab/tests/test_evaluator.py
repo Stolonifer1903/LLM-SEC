@@ -24,7 +24,21 @@ from evaluator import (
 
 
 LAB_DIR = Path(__file__).resolve().parents[1]
-SUPPORTED_APPS = {"juice_shop", "dvwa"}
+SUPPORTED_APPS = {"juice_shop", "vulnerable_app"}
+FIXTURE_ALERTS = [
+    {
+        "app": "juice_shop", "alert_name": "Timestamp Disclosure - Unix",
+        "cweid": "497", "url": "http://juice-shop:3000/app.js", "evidence": "1700000000",
+    },
+    {
+        "app": "juice_shop", "alert_name": "Cross-Domain Misconfiguration",
+        "cweid": "264", "url": "http://juice-shop:3000/public", "evidence": "Access-Control-Allow-Origin: *",
+    },
+    {
+        "app": "juice_shop", "alert_name": "Content Security Policy (CSP) Header Not Set",
+        "cweid": "693", "url": "http://juice-shop:3000/", "evidence": "",
+    },
+]
 
 
 class GroundTruthRuleTests(unittest.TestCase):
@@ -32,19 +46,7 @@ class GroundTruthRuleTests(unittest.TestCase):
     def setUpClass(cls):
         cls.gt = load_ground_truth(LAB_DIR / "ground_truth.csv")
         cls.rules = load_match_rules(LAB_DIR / "ground_truth_match_rules.csv", cls.gt)
-        with open(LAB_DIR / "zap_alerts.json", encoding="utf-8") as file:
-            cls.alerts = [
-                alert for alert in json.load(file)
-                if alert.get("app") in SUPPORTED_APPS
-            ]
-        seen = set()
-        cls.alerts = [
-            alert for alert in cls.alerts
-            if not (
-                (alert["alert_name"], alert["url"]) in seen
-                or seen.add((alert["alert_name"], alert["url"]))
-            )
-        ]
+        cls.alerts = list(FIXTURE_ALERTS)
         cls.pipeline_alerts = [
             {
                 "alert_id": index,
@@ -55,7 +57,7 @@ class GroundTruthRuleTests(unittest.TestCase):
         ]
 
     def test_provider_key_catalogue_is_normalized_to_challenge_id(self):
-        self.assertEqual(len(self.gt), 96)
+        self.assertEqual(len(self.gt), 225)
         self.assertIn("provider_key", self.gt.columns)
         self.assertIn("challenge_id", self.gt.columns)
         self.assertTrue((self.gt["provider_key"] == self.gt["challenge_id"]).all())
@@ -66,8 +68,8 @@ class GroundTruthRuleTests(unittest.TestCase):
         audit = build_match_audit(self.pipeline_alerts, self.rules)
         counts = audit["ground_truth_label"].value_counts().to_dict()
         self.assertEqual(counts.get("VULNERABLE", 0), 0)
-        self.assertEqual(counts["NOT_VULNERABLE"], 36)
-        self.assertEqual(counts["UNMAPPED"], 231)
+        self.assertEqual(counts["NOT_VULNERABLE"], 2)
+        self.assertEqual(counts["UNMAPPED"], 1)
         self.assertEqual(len(audit), len(self.pipeline_alerts))
 
     def test_unlinked_csp_and_clickjacking_alerts_are_unmapped(self):
@@ -77,13 +79,13 @@ class GroundTruthRuleTests(unittest.TestCase):
                 "Content Security Policy (CSP) Header Not Set",
             }
         ]
-        self.assertEqual(len(header_alerts), 28)
+        self.assertEqual(len(header_alerts), 1)
         for alert in header_alerts:
             match = match_alert_to_ground_truth(alert, self.rules)
             self.assertEqual(match["ground_truth_label"], "UNMAPPED")
 
     def test_overlapping_rules_are_rejected_for_an_alert(self):
-        alert = self.pipeline_alerts[0]
+        alert = next(alert for alert in self.pipeline_alerts if alert["alert_name"] == "Cross-Domain Misconfiguration")
         base_rule = {
             "app": "juice_shop",
             "zap_alert_name": "cross-domain misconfiguration",
@@ -112,7 +114,7 @@ class GroundTruthRuleTests(unittest.TestCase):
                     "challenge_ids", "rationale",
                 ])
                 writer.writerow([
-                    "bad", "dvwa", "SQL Injection", "CWE-89", "", "",
+                    "bad", "vulnerable_app", "SQL Injection", "CWE-89", "", "",
                     "VULNERABLE", "DOES-NOT-EXIST", "test",
                 ])
             with self.assertRaisesRegex(ValueError, "unknown challenge IDs"):
@@ -125,10 +127,10 @@ class PairedDesignAndMetricTests(unittest.TestCase):
         record = {
             "prompt_strategy": strategy,
             "alert_id": alert_id,
-            "app": "dvwa",
+            "app": "vulnerable_app",
             "alert_name": "SQL Injection",
             "zap_cwe_id": "CWE-89",
-            "url": "http://dvwa/vulnerabilities/sqli/",
+            "url": "http://vulnerable-app:9090/VulnerableApp/SQLInjectionVulnerability/LEVEL_1",
             "evidence": "",
             "parsed_successfully": True,
             "predicted_vulnerable": True,
@@ -196,7 +198,7 @@ class EndToEndEvaluationTests(unittest.TestCase):
             with open(ground_truth_path, "w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
                 writer.writerow(["app", "provider_key", "ground_truth_label"])
-                writer.writerow(["dvwa", "DVWA-SQLI", "VULNERABLE"])
+                writer.writerow(["vulnerable_app", "VULNERABLE_APP-SQLI", "VULNERABLE"])
             with open(rules_path, "w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
                 writer.writerow([
@@ -204,8 +206,8 @@ class EndToEndEvaluationTests(unittest.TestCase):
                     "evidence_regex", "ground_truth_label", "challenge_ids", "rationale",
                 ])
                 writer.writerow([
-                    "positive", "dvwa", "SQL Injection", "CWE-89", "^/vulnerabilities/sqli$",
-                    "", "VULNERABLE", "DVWA-SQLI", "positive fixture",
+                    "positive", "vulnerable_app", "SQL Injection", "CWE-89", "^/VulnerableApp/SQLInjectionVulnerability/LEVEL_1$",
+                    "", "VULNERABLE", "VULNERABLE_APP-SQLI", "positive fixture",
                 ])
                 writer.writerow([
                     "negative", "juice_shop", "Timestamp Disclosure - Unix", "CWE-497",
@@ -214,8 +216,8 @@ class EndToEndEvaluationTests(unittest.TestCase):
 
             alerts = [
                 {
-                    "alert_id": 0, "app": "dvwa", "alert_name": "SQL Injection",
-                    "zap_cwe_id": "CWE-89", "url": "http://dvwa/vulnerabilities/sqli/",
+                    "alert_id": 0, "app": "vulnerable_app", "alert_name": "SQL Injection",
+                    "zap_cwe_id": "CWE-89", "url": "http://vulnerable-app:9090/VulnerableApp/SQLInjectionVulnerability/LEVEL_1",
                     "evidence": "database error",
                 },
                 {
@@ -275,19 +277,7 @@ class EndToEndEvaluationTests(unittest.TestCase):
             self.assertFalse(paths["statistics"].exists())
 
     def test_negative_only_crosswalk_writes_audit_then_blocks_metrics(self):
-        with open(LAB_DIR / "zap_alerts.json", encoding="utf-8") as file:
-            alerts = [
-                alert for alert in json.load(file)
-                if alert.get("app") in SUPPORTED_APPS
-            ]
-        seen = set()
-        alerts = [
-            alert for alert in alerts
-            if not (
-                (alert["alert_name"], alert["url"]) in seen
-                or seen.add((alert["alert_name"], alert["url"]))
-            )
-        ]
+        alerts = list(FIXTURE_ALERTS)
         records = []
         for strategy in PROMPT_STRATEGIES:
             for alert_id, alert in enumerate(alerts):

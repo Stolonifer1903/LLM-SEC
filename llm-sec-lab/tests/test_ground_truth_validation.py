@@ -19,9 +19,9 @@ class GroundTruthValidationOverlayTests(unittest.TestCase):
                 ])
                 writer.writeheader()
                 writer.writerows([
-                    {"app": "dvwa", "provider_key": "DVWA-FI", "zap_detection_mode": "manual",
+                    {"app": "vulnerable_app", "provider_key": "VULNERABLE_APP-FI", "zap_detection_mode": "manual",
                      "expected_zap_alert_names": "N/A", "cwe_id": "CWE-98", "ground_truth_label": "VULNERABLE"},
-                    {"app": "dvwa", "provider_key": "DVWA-SQLI", "zap_detection_mode": "zap_active",
+                    {"app": "vulnerable_app", "provider_key": "VULNERABLE_APP-SQLI", "zap_detection_mode": "zap_active",
                      "expected_zap_alert_names": "SQL Injection", "cwe_id": "CWE-89", "ground_truth_label": "VULNERABLE"},
                 ])
             with overlay.open("w", newline="", encoding="utf-8") as file:
@@ -32,7 +32,7 @@ class GroundTruthValidationOverlayTests(unittest.TestCase):
                 ])
                 writer.writeheader()
                 writer.writerow({
-                    "provider_key": "DVWA-FI", "app": "dvwa", "current_detection_mode": "manual",
+                    "provider_key": "VULNERABLE_APP-FI", "app": "vulnerable_app", "current_detection_mode": "manual",
                     "validation_status": "candidate", "validated_detection_mode": "",
                     "zap_alert_name": "Path Traversal", "zap_cwe_id": "CWE-22",
                     "url_regex": "^/vulnerabilities/fi$", "evidence_regex": "root:x:0:0",
@@ -40,10 +40,10 @@ class GroundTruthValidationOverlayTests(unittest.TestCase):
                 })
             validation = load_detection_validation(overlay, load_ground_truth(ground_truth))
 
-        self.assertEqual(set(validation["provider_key"]), {"DVWA-FI", "DVWA-SQLI"})
+        self.assertEqual(set(validation["provider_key"]), {"VULNERABLE_APP-FI", "VULNERABLE_APP-SQLI"})
         statuses = dict(zip(validation["provider_key"], validation["validation_status"]))
-        self.assertEqual(statuses["DVWA-FI"], "candidate")
-        self.assertEqual(statuses["DVWA-SQLI"], "candidate")
+        self.assertEqual(statuses["VULNERABLE_APP-FI"], "candidate")
+        self.assertEqual(statuses["VULNERABLE_APP-SQLI"], "candidate")
 
 
 if __name__ == "__main__":

@@ -741,7 +741,7 @@ def evaluate_pipeline_results(
             "blocking_reasons": blocking_reasons,
             "reason": (
                 "No mapped alert has a VULNERABLE ground-truth label. Add a defensible "
-                "Juice Shop or DVWA positive match rule before calculating classification "
+                "Juice Shop or OWASP VulnerableApp positive match rule before calculating classification "
                 "metrics or paired statistical tests."
             ),
         }
@@ -761,7 +761,7 @@ def evaluate_pipeline_results(
         )
         raise ValueError(
             "Evaluation blocked: zero mapped VULNERABLE alerts. Add a defensible "
-            "Juice Shop or DVWA positive rule and rerun evaluation."
+            "Juice Shop or OWASP VulnerableApp positive rule and rerun evaluation."
         )
 
     if parse_quality["below_threshold_strategies"]:
