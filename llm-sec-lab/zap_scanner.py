@@ -5,58 +5,107 @@ import re
 import requests
 from collections import Counter
 from datetime import datetime, timezone
-from urllib.parse import urlencode
+from urllib.parse import urlsplit
 
 ZAP_BASE_URL = 'http://localhost:8090'
 ZAP_API_BASE = f'{ZAP_BASE_URL}/JSON'
 API_TIMEOUT = (3, 5)
 SESSION_RESET_TIMEOUT = (3, float(os.getenv("ZAP_SESSION_RESET_TIMEOUT_SECONDS", "90")))
 MAX_STATUS_TIMEOUTS = 120
-SPIDER_MAX_DEPTH = int(os.getenv("ZAP_SPIDER_MAX_DEPTH", "10"))
-SPIDER_MAX_CHILDREN = int(os.getenv("ZAP_SPIDER_MAX_CHILDREN", "500"))
-AJAX_SPIDER_MAX_DURATION_MINS = int(os.getenv("ZAP_AJAX_MAX_DURATION_MINS", "20"))
-ACTIVE_SCAN_THREADS_PER_HOST = int(os.getenv("ZAP_ACTIVE_THREADS_PER_HOST", "2"))
-DVWA_HOST_URL = os.getenv("DVWA_HOST_URL", "http://localhost:8081")
-DVWA_USERNAME = os.getenv("DVWA_USERNAME", "admin")
-DVWA_PASSWORD = os.getenv("DVWA_PASSWORD", "password")
+SPIDER_MAX_DEPTH = int(os.getenv("ZAP_SPIDER_MAX_DEPTH", "0"))
+SPIDER_MAX_CHILDREN = int(os.getenv("ZAP_SPIDER_MAX_CHILDREN", "0"))
+AJAX_SPIDER_MAX_DURATION_MINS = int(os.getenv("ZAP_AJAX_MAX_DURATION_MINS", "0"))
+AJAX_SPIDER_BROWSERS = int(os.getenv("ZAP_AJAX_BROWSERS", "4"))
+ACTIVE_SCAN_THREADS_PER_HOST = int(os.getenv("ZAP_ACTIVE_THREADS_PER_HOST", "4"))
+BENCHMARK_ENDPOINT = os.getenv(
+    "VULNERABLE_APP_BENCHMARK_URL",
+    "http://localhost:9090/VulnerableApp/scanner/benchmark",
+)
+VULNERABLE_APP_CATALOG_URL = os.getenv(
+    "VULNERABLE_APP_CATALOG_URL",
+    "http://localhost:9090/VulnerableApp/allEndPointJson",
+)
 
 TARGET_PROFILES = {
     "juice_shop": {
         "context_name": "juice_shop_dast",
-        "exclude_regexes": [
+        # Keep the legacy /juice-shop/ static alias out of crawler scope; it
+        # expands into a recursive dependency tree. /ftp remains in scope.
+        "context_exclude_regexes": [
             r"http://juice-shop:3000/juice-shop/.*",
-            # Keep these resources in passive-scan history, but do not use
-            # them as active-scan attack targets. They create a large number
-            # of non-application paths and can exhaust the Juice Shop process.
-            r"http://juice-shop:3000/(?:assets|build|node_modules|fonts|i18n|ftp|socket\.io)(?:/.*)?",
+        ],
+        "active_scan_exclude_regexes": [
+            # Discover these resources and retain their passive-scan history,
+            # but do not actively attack them. They create a large number of
+            # non-application paths and can exhaust the Juice Shop process.
+            r"http://juice-shop:3000/(?:assets|build|node_modules|fonts|i18n|socket\.io)(?:/.*)?",
         ],
         "use_ajax_spider": True,
-        "required_paths": ["/rest/products/search"],
+        "use_client_spider": True,
+        "required_paths": [
+            "/api/Challenges/",
+            "/api/Feedbacks/",
+            "/api/Quantitys/",
+            "/ftp/legal.md",
+            "/rest/admin/application-configuration",
+            "/rest/admin/application-version",
+            "/rest/captcha/",
+            "/rest/languages",
+            "/rest/products/1/reviews",
+            "/rest/products/search",
+            "/rest/user/whoami",
+        ],
     },
-    "dvwa": {
-        "context_name": "dvwa_dast",
-        "exclude_regexes": [],
-        "use_ajax_spider": False,
-        "required_paths": ["/vulnerabilities/sqli/", "/vulnerabilities/exec/"],
+    "vulnerable_app": {
+        "context_name": "vulnerable_app_dast",
+        "context_exclude_regexes": [],
+        "active_scan_exclude_regexes": [],
+        "use_ajax_spider": True,
+        "use_client_spider": True,
+        "required_paths": ["/VulnerableApp/"],
     },
 }
 SCAN_METADATA = []
-SCAN_PROFILES = ("baseline", "targeted")
+SCAN_PROFILES = ("benchmark", "baseline", "targeted")
 TARGETED_SCANNER_IDS = (6, 20019, 40012, 40014, 40017, 40018, 40019, 40020, 40021, 40022, 40026, 40027, 90020, 90037)
 NOISE_SCANNER_ID = 10104
+PROFILE_SCAN_POLICIES = {
+    "benchmark": "Pen Test",
+    "baseline": "Default Policy",
+    "targeted": "Default Policy",
+}
+ACTIVE_SCAN_INPUT_VECTORS = {
+    "query_and_data_driven_nodes": True,
+    "post_data": True,
+    "multipart_form_data": True,
+    "xml": True,
+    "json": True,
+    "url_path": True,
+    "http_headers_all_requests": True,
+    "cookies": True,
+    "scripts": True,
+}
 TARGETED_REQUESTS = {
     "juice_shop": [
         {"url": "/rest/products/search?q=apple", "method": "GET", "post_data": ""},
     ],
-    "dvwa": [
-        {"url": "/vulnerabilities/sqli/?id=1&Submit=Submit", "method": "GET", "post_data": ""},
-        {"url": "/vulnerabilities/sqli_blind/?id=1&Submit=Submit", "method": "GET", "post_data": ""},
-        {"url": "/vulnerabilities/exec/", "method": "POST", "post_data": "ip=127.0.0.1&Submit=Submit"},
-        {"url": "/vulnerabilities/fi/?page=include.php", "method": "GET", "post_data": ""},
-        {"url": "/vulnerabilities/xss_r/?name=ZAP", "method": "GET", "post_data": ""},
-        {"url": "/vulnerabilities/xss_s/", "method": "POST", "post_data": "txtName=ZAP&mtxMessage=seed&btnSign=Sign+Guestbook"},
+    "vulnerable_app": [
+        {"url": "/", "method": "GET", "post_data": ""},
     ],
 }
+JUICE_SHOP_SEED_PATHS = (
+    "/api/Challenges/?name=Score%20Board",
+    "/api/Feedbacks/",
+    "/api/Quantitys/",
+    "/ftp/legal.md",
+    "/rest/admin/application-configuration",
+    "/rest/admin/application-version",
+    "/rest/captcha/",
+    "/rest/languages",
+    "/rest/products/1/reviews",
+    "/rest/products/search?q=apple",
+    "/rest/user/whoami",
+)
 
 session = requests.Session()
 session.trust_env = False
@@ -68,34 +117,70 @@ def zap_api(component: str, kind: str, endpoint: str, *, request_timeout=API_TIM
     response.raise_for_status()
     return response.json()
 
-def configure_active_scan(scan_profile: str = "baseline") -> list[dict]:
+def configure_active_scan(scan_profile: str = "benchmark") -> list[dict]:
     if scan_profile not in SCAN_PROFILES:
         raise ValueError(f"Unknown scan profile: {scan_profile}")
+    scan_policy = PROFILE_SCAN_POLICIES[scan_profile]
     # This is an authorized lab scan. Zero removes ZAP's active-scan caps.
     zap_api("ascan", "action", "setOptionThreadPerHost", Integer=ACTIVE_SCAN_THREADS_PER_HOST)
     zap_api("ascan", "action", "setOptionMaxRuleDurationInMins", Integer=0)
     zap_api("ascan", "action", "setOptionMaxScanDurationInMins", Integer=0)
     zap_api("ascan", "action", "setOptionMaxAlertsPerRule", Integer=0)
     zap_api("ascan", "action", "setOptionHandleAntiCSRFTokens", Boolean="true")
-    # DVWA issues this token on its login and test forms. Register it before
-    # authenticated crawling so ZAP can refresh the value between requests.
-    zap_api("acsrf", "action", "addOptionToken", String="user_token")
+    zap_api("ascan", "action", "setOptionAddQueryParam", Boolean="true")
+    zap_api("ascan", "action", "setOptionScanHeadersAllRequests", Boolean="true")
+    zap_api("ascan", "action", "setOptionInjectPluginIdInHeader", Boolean="true")
     # ZAP 2.17 exposes separate enable/disable actions rather than a
     # setScannerEnabled action.
-    zap_api("ascan", "action", "enableScanners", ids=str(NOISE_SCANNER_ID))
+    if scan_profile == "benchmark":
+        # Pen Test is the installed policy which enables every non-example active
+        # rule. Keep the user-agent fuzzer off: it is noise for this benchmark.
+        zap_api("ascan", "action", "enableAllScanners", scanPolicyName=scan_policy)
+        zap_api(
+            "ascan", "action", "disableScanners",
+            ids=str(NOISE_SCANNER_ID), scanPolicyName=scan_policy,
+        )
+        scanners = zap_api(
+            "ascan", "view", "scanners", scanPolicyName=scan_policy,
+        ).get("scanners", [])
+        for scanner in scanners:
+            scanner_id = str(scanner.get("id", "")).strip()
+            if not scanner_id or scanner_id == str(NOISE_SCANNER_ID):
+                continue
+            zap_api(
+                "ascan", "action", "setScannerAttackStrength",
+                id=scanner_id, attackStrength="HIGH", scanPolicyName=scan_policy,
+            )
+            zap_api(
+                "ascan", "action", "setScannerAlertThreshold",
+                id=scanner_id, alertThreshold="LOW", scanPolicyName=scan_policy,
+            )
+        return zap_api(
+            "ascan", "view", "scanners", scanPolicyName=scan_policy,
+        ).get("scanners", [])
+
+    zap_api(
+        "ascan", "action", "enableScanners",
+        ids=str(NOISE_SCANNER_ID), scanPolicyName=scan_policy,
+    )
     for scanner_id in TARGETED_SCANNER_IDS:
         zap_api(
             "ascan", "action", "setScannerAttackStrength",
-            id=str(scanner_id), attackStrength="DEFAULT",
+            id=str(scanner_id), attackStrength="DEFAULT", scanPolicyName=scan_policy,
         )
     if scan_profile == "targeted":
-        zap_api("ascan", "action", "disableScanners", ids=str(NOISE_SCANNER_ID))
+        zap_api(
+            "ascan", "action", "disableScanners",
+            ids=str(NOISE_SCANNER_ID), scanPolicyName=scan_policy,
+        )
         for scanner_id in TARGETED_SCANNER_IDS:
             zap_api(
                 "ascan", "action", "setScannerAttackStrength",
-                id=str(scanner_id), attackStrength="HIGH",
+                id=str(scanner_id), attackStrength="HIGH", scanPolicyName=scan_policy,
             )
-    return zap_api("ascan", "view", "scanners").get("scanners", [])
+    return zap_api(
+        "ascan", "view", "scanners", scanPolicyName=scan_policy,
+    ).get("scanners", [])
 
 
 def configure_spider() -> None:
@@ -105,9 +190,13 @@ def configure_spider() -> None:
 
 
 def configure_ajax_spider() -> None:
-    zap_api("ajaxSpider", "action", "setOptionMaxCrawlDepth", Integer=SPIDER_MAX_DEPTH)
+    if AJAX_SPIDER_BROWSERS < 1:
+        raise ValueError("ZAP_AJAX_BROWSERS must be at least 1")
+    if AJAX_SPIDER_MAX_DURATION_MINS < 0:
+        raise ValueError("ZAP_AJAX_MAX_DURATION_MINS cannot be negative")
+    zap_api("ajaxSpider", "action", "setOptionMaxCrawlDepth", Integer=0)
     zap_api("ajaxSpider", "action", "setOptionMaxDuration", Integer=AJAX_SPIDER_MAX_DURATION_MINS)
-    zap_api("ajaxSpider", "action", "setOptionNumberOfBrowsers", Integer=1)
+    zap_api("ajaxSpider", "action", "setOptionNumberOfBrowsers", Integer=AJAX_SPIDER_BROWSERS)
 
 def wait_for_progress(get_status, scan_id: str, label: str, poll_seconds: int) -> None:
     start = time.time()
@@ -136,7 +225,7 @@ def wait_for_progress(get_status, scan_id: str, label: str, poll_seconds: int) -
 
 def scan_id_from_response(response: dict, action: str, scan_label: str) -> str:
     """Return ZAP's scan identifier for either normal or user-scoped actions."""
-    for key in ("scan", action):
+    for key in ("scan", "scanId", action):
         scan_id = response.get(key)
         if scan_id is not None and str(scan_id):
             return str(scan_id)
@@ -183,100 +272,25 @@ def create_context(target_url: str, scan_label: str) -> dict:
         # regex is matched against the complete URL, including the no-slash root.
         regex=rf"{re.escape(target_url)}(?:/.*)?",
     )
-    for pattern in profile["exclude_regexes"]:
+    for pattern in profile["context_exclude_regexes"]:
         zap_api("context", "action", "excludeFromContext", contextName=context_name, regex=pattern)
     return {"id": context_id, "name": context_name}
 
 
-def _extract_csrf_token(response: requests.Response) -> str:
-    match = re.search(r"name=['\"]user_token['\"]\s+value=['\"]([^'\"]+)", response.text)
-    if not match:
-        raise RuntimeError("DVWA response did not include the expected user_token")
-    return match.group(1)
+def configure_active_scan_exclusions(scan_label: str) -> list[str]:
+    """Replace global active-scan exclusions with this target's host-scoped rules."""
+    patterns = list(TARGET_PROFILES[scan_label]["active_scan_exclude_regexes"])
+    zap_api("ascan", "action", "clearExcludedFromScan")
+    for pattern in patterns:
+        zap_api("ascan", "action", "excludeFromScan", regex=pattern)
+    return patterns
 
 
-def prepare_dvwa() -> None:
-    """Reset DVWA's lab database so the documented low-security test state is available."""
-    dvwa = requests.Session()
-    dvwa.trust_env = False
-    setup = dvwa.get(f"{DVWA_HOST_URL}/setup.php", timeout=30)
-    setup.raise_for_status()
-    reset = dvwa.post(
-        f"{DVWA_HOST_URL}/setup.php",
-        data={"create_db": "Create / Reset Database", "user_token": _extract_csrf_token(setup)},
-        timeout=60,
-    )
-    reset.raise_for_status()
-    if "Database has been created" not in reset.text and "Database has been reset" not in reset.text:
-        raise RuntimeError("DVWA database preparation did not report a successful reset")
-
-
-def configure_dvwa_user(context: dict, target_url: str) -> str:
-    # DVWA rejects the login POST unless its per-page anti-CSRF token is sent.
-    # ZAP refreshes {%user_token%} from the login form because the token name
-    # is registered in configure_active_scan().
-    login_request_data = (
-        "username={%username%}&password={%password%}&Login=Login&"
-        "user_token={%user_token%}"
-    )
-    auth_config = urlencode({
-        "loginUrl": f"{target_url}/login.php",
-        "loginRequestData": login_request_data,
-    })
-    zap_api(
-        "authentication",
-        "action",
-        "setAuthenticationMethod",
-        contextId=context["id"],
-        authMethodName="formBasedAuthentication",
-        authMethodConfigParams=auth_config,
-    )
-    zap_api(
-        "sessionManagement",
-        "action",
-        "setSessionManagementMethod",
-        contextId=context["id"],
-        methodName="cookieBasedSessionManagement",
-        methodConfigParams="",
-    )
-    zap_api(
-        "authentication",
-        "action",
-        "setLoggedInIndicator",
-        contextId=context["id"],
-        loggedInIndicatorRegex="Logout",
-    )
-    zap_api(
-        "authentication",
-        "action",
-        "setLoggedOutIndicator",
-        contextId=context["id"],
-        loggedOutIndicatorRegex="Login ::",
-    )
-    user_id = zap_api(
-        "users", "action", "newUser", contextId=context["id"], name="dvwa_admin"
-    )["userId"]
-    zap_api(
-        "users",
-        "action",
-        "setAuthenticationCredentials",
-        contextId=context["id"],
-        userId=user_id,
-        authCredentialsConfigParams=urlencode({
-            "username": DVWA_USERNAME,
-            "password": DVWA_PASSWORD,
-        }),
-    )
-    zap_api("users", "action", "setUserEnabled", contextId=context["id"], userId=user_id, enabled="true")
-    return user_id
-
-
-def seed_juice_shop_requests(target_url: str) -> None:
+def seed_juice_shop_requests(target_url: str) -> dict:
     """Add stable, read-only API routes to ZAP's history before active scanning."""
-    seed_urls = [
-        f"{target_url}/rest/products/search?q=apple",
-        f"{target_url}/rest/products/1/reviews",
-    ]
+    seed_urls = [f"{target_url}{path}" for path in JUICE_SHOP_SEED_PATHS]
+    seeded = 0
+    failed_urls = []
     for url in seed_urls:
         try:
             zap_api("core", "action", "accessUrl", url=url, followRedirects="true")
@@ -284,9 +298,109 @@ def seed_juice_shop_requests(target_url: str) -> None:
             # Discovery validation below remains authoritative. A failed
             # convenience seed must not discard an otherwise valid crawl.
             print(f"[juice_shop] API seed request failed for {url}: {exc}")
+            failed_urls.append(url)
+        else:
+            seeded += 1
+    return {
+        "attempted": len(seed_urls),
+        "seeded": seeded,
+        "failed": len(failed_urls),
+        "failed_urls": failed_urls,
+        "error": "",
+    }
 
 
-def run_targeted_active_scans(target_url: str, scan_label: str, context: dict, user_id: str | None) -> list[dict]:
+def _vulnerable_app_seed_specs(target_url: str) -> list[dict]:
+    """Build method-correct seed requests from VulnerableApp's scanner catalogue."""
+    response = session.get(VULNERABLE_APP_CATALOG_URL, timeout=API_TIMEOUT)
+    response.raise_for_status()
+    specs, seen = [], set()
+    for family in response.json():
+        name = str(family.get("Name", "")).strip()
+        for level in family.get("Detailed Information", []):
+            route = f"/{name}/{str(level.get('Level', '')).strip()}"
+            method = str(level.get("HttpMethod", "GET")).strip().upper() or "GET"
+            if not name or route.endswith("/"):
+                continue
+            key = (route, method)
+            if key in seen:
+                continue
+            seen.add(key)
+            # A benign parameter gives active rules a concrete input vector on
+            # routes whose templates consume arbitrary query/body parameters.
+            if method == "GET":
+                specs.append({"method": method, "url": f"{target_url}{route}?zap_seed=1", "body": "", "content_type": ""})
+            elif name == "XXEVulnerability":
+                specs.append({
+                    "method": method, "url": f"{target_url}{route}",
+                    "body": "<zapSeed><value>1</value></zapSeed>",
+                    "content_type": "application/xml",
+                })
+            else:
+                specs.append({
+                    "method": method, "url": f"{target_url}{route}",
+                    "body": "username=zap_seed&password=zap_seed&input=zap_seed&comment=zap_seed&file=zap_seed.txt",
+                    "content_type": "application/x-www-form-urlencoded",
+                })
+    return specs
+
+
+def _raw_seed_request(spec: dict) -> str:
+    parsed = urlsplit(spec["url"])
+    path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    body = spec["body"]
+    headers = [
+        f"{spec['method']} {path} HTTP/1.1",
+        f"Host: {parsed.netloc}",
+        "User-Agent: LLM-SEC-ZAP-Benchmark-Seed",
+    ]
+    if body:
+        headers.extend([
+            f"Content-Type: {spec['content_type']}",
+            f"Content-Length: {len(body.encode('utf-8'))}",
+        ])
+    return "\r\n".join(headers) + "\r\n\r\n" + body
+
+
+def seed_vulnerable_app_requests(target_url: str) -> dict:
+    """Prime ZAP history with benchmark routes, methods, and safe input vectors."""
+    try:
+        specs = _vulnerable_app_seed_specs(target_url)
+    except requests.RequestException as exc:
+        print(f"[vulnerable_app] Benchmark catalogue unavailable; continuing without route seeds: {exc}")
+        return {
+            "attempted": 0, "seeded": 0, "failed": 0,
+            "failed_urls": [], "error": str(exc),
+        }
+
+    seeded = 0
+    failed_urls = []
+    for spec in specs:
+        try:
+            zap_api(
+                "core", "action", "sendRequest",
+                request=_raw_seed_request(spec), followRedirects="true",
+            )
+            seeded += 1
+        except requests.RequestException as exc:
+            print(f"[vulnerable_app] Seed request failed for {spec['method']} {spec['url']}: {exc}")
+            failed_urls.append(spec["url"])
+    return {
+        "attempted": len(specs),
+        "seeded": seeded,
+        "failed": len(failed_urls),
+        "failed_urls": failed_urls,
+        "error": "",
+    }
+
+
+def run_targeted_active_scans(
+    target_url: str,
+    scan_label: str,
+    context: dict,
+    user_id: str | None,
+    scan_policy: str,
+) -> list[dict]:
     """Run reproducible, endpoint-specific scans after normal discovery."""
     scan_ids = []
     for request_spec in TARGETED_REQUESTS[scan_label]:
@@ -295,7 +409,7 @@ def run_targeted_active_scans(target_url: str, scan_label: str, context: dict, u
             "url": url,
             "recurse": "false",
             "inScopeOnly": "true",
-            "scanPolicyName": "Default Policy",
+            "scanPolicyName": scan_policy,
             "method": request_spec["method"],
             "postData": request_spec["post_data"],
             "contextId": context["id"],
@@ -326,13 +440,13 @@ def start_fresh_zap_session() -> None:
     )
 
 
-def wait_for_ajax_spider(timeout=AJAX_SPIDER_MAX_DURATION_MINS * 60 + 120) -> None:
+def wait_for_ajax_spider(timeout=None) -> None:
     start = time.time()
     while True:
         status = zap_api("ajaxSpider", "view", "status").get("status", "")
         if status.lower() == "stopped":
             return
-        if time.time() - start > timeout:
+        if timeout is not None and time.time() - start > timeout:
             zap_api("ajaxSpider", "action", "stop")
             raise TimeoutError("AJAX spider did not complete within its configured duration")
         elapsed_minutes = (time.time() - start) / 60
@@ -349,6 +463,25 @@ def wait_for_passive_scan(timeout=300) -> None:
         if time.time() - start > timeout:
             raise TimeoutError(f"Passive scan queue did not drain; {remaining} records remain")
         time.sleep(2)
+
+
+def run_client_spider(target_url: str, context: dict, scan_label: str) -> bool:
+    """Use browser-driven discovery when the installed ZAP supports it."""
+    try:
+        response = zap_api(
+            "clientSpider", "action", "scan", browser="firefox-headless",
+            url=target_url, contextName=context["name"], subtreeOnly="true",
+            maxCrawlDepth=0, pageLoadTime=10, numberOfBrowsers=1, scopeCheck="STRICT",
+        )
+        scan_id = scan_id_from_response(response, "scan", scan_label)
+        wait_for_progress(
+            lambda current_id: zap_api("clientSpider", "view", "status", scanId=current_id)["status"],
+            scan_id, "Client spider", 5,
+        )
+        return True
+    except requests.RequestException as exc:
+        print(f"[{scan_label}] Client spider unavailable; continuing with AJAX spider: {exc}")
+        return False
 
 
 def get_target_urls(target_url: str) -> list[str]:
@@ -369,19 +502,32 @@ def verify_discovery(target_url: str, scan_label: str) -> list[str]:
     return urls
 
 
-def run_scan(target_url: str, scan_label: str, scan_profile: str = "baseline") -> list[dict]:
+def _request_method(message_id) -> str:
+    if message_id is None or str(message_id).strip() in {"", "-1"}:
+        return ""
+    try:
+        response = zap_api("core", "view", "message", id=str(message_id))
+    except (requests.RequestException, ValueError):
+        return ""
+    message = response.get("message", response)
+    if not isinstance(message, dict):
+        return ""
+    header = str(message.get("requestHeader", ""))
+    first_line = header.splitlines()[0] if header else ""
+    return first_line.split(" ", 1)[0].upper() if " " in first_line else ""
+
+
+def run_scan(target_url: str, scan_label: str, scan_profile: str = "benchmark") -> list[dict]:
     if scan_label not in TARGET_PROFILES:
         raise ValueError(f"No DAST target profile configured for {scan_label}")
     if scan_profile not in SCAN_PROFILES:
         raise ValueError(f"Unknown scan profile: {scan_profile}")
+    scan_policy = PROFILE_SCAN_POLICIES[scan_profile]
     scan_started_at = datetime.now(timezone.utc)
     configure_spider()
     scanner_snapshot = configure_active_scan(scan_profile)
     context = create_context(target_url, scan_label)
     user_id = None
-    if scan_label == "dvwa":
-        prepare_dvwa()
-        user_id = configure_dvwa_user(context, target_url)
 
     print(f"[{scan_label}] Starting authenticated-aware spider on {target_url}")
     spider_action = "scanAsUser" if user_id is not None else "scan"
@@ -419,10 +565,22 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "baseline") -
         wait_for_ajax_spider()
         print(f"\n[{scan_label}] AJAX spider complete.")
 
+    client_spider_completed = False
+    if TARGET_PROFILES[scan_label]["use_client_spider"]:
+        print(f"[{scan_label}] Starting browser-driven client spider on {target_url}")
+        client_spider_completed = run_client_spider(target_url, context, scan_label)
+
+    crawler_discovered_urls = get_target_urls(target_url)
+    seed_summary = {
+        "attempted": 0, "seeded": 0, "failed": 0, "failed_urls": [], "error": "",
+    }
     if scan_label == "juice_shop":
-        seed_juice_shop_requests(target_url)
+        seed_summary = seed_juice_shop_requests(target_url)
+    elif scan_label == "vulnerable_app":
+        seed_summary = seed_vulnerable_app_requests(target_url)
     wait_for_passive_scan()
     discovered_urls = verify_discovery(target_url, scan_label)
+    active_scan_exclusions = configure_active_scan_exclusions(scan_label)
 
     print(f"[{scan_label}] Starting active scan on {target_url}")
     active_action = "scanAsUser" if user_id is not None else "scan"
@@ -430,7 +588,7 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "baseline") -
         "url": target_url,
         "recurse": "true",
         "inScopeOnly": "true",
-        "scanPolicyName": "Default Policy",
+        "scanPolicyName": scan_policy,
         "method": "",
         "postData": "",
         "contextId": context["id"],
@@ -450,7 +608,9 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "baseline") -
     targeted_scans = []
     if scan_profile == "targeted":
         print(f"[{scan_label}] Starting focused targeted active scans.")
-        targeted_scans = run_targeted_active_scans(target_url, scan_label, context, user_id)
+        targeted_scans = run_targeted_active_scans(
+            target_url, scan_label, context, user_id, scan_policy,
+        )
 
     raw_alerts = zap_api("core", "view", "alerts", baseurl=target_url)["alerts"]
     alerts = []
@@ -472,6 +632,7 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "baseline") -
             "other": a.get("other", ""),
             "tags": a.get("tags", {}),
             "message_id": a.get("messageId", a.get("messageid")),
+            "request_method": _request_method(a.get("messageId", a.get("messageid"))),
             "scan_profile": scan_profile,
         })
     SCAN_METADATA.append({
@@ -482,6 +643,12 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "baseline") -
         "scan_profile": scan_profile,
         "effective_scanners": scanner_snapshot,
         "targeted_scans": targeted_scans,
+        "benchmark_route_seeds": seed_summary,
+        "client_spider_completed": client_spider_completed,
+        "crawler_discovered_url_count": len(crawler_discovered_urls),
+        "crawler_discovered_urls": crawler_discovered_urls,
+        "active_scan_exclusions": active_scan_exclusions,
+        "required_paths": list(TARGET_PROFILES[scan_label]["required_paths"]),
         "started_at_utc": scan_started_at.isoformat(),
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
         "discovered_url_count": len(discovered_urls),
@@ -524,6 +691,7 @@ def save_scan_report(alerts: list[dict], path: str, scan_profile: str = "baselin
             "Cross-Domain Misconfiguration",
         }
     ]
+    request_method_populated_count = sum(bool(alert.get("request_method")) for alert in alerts)
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "scanner_configuration": {
@@ -531,10 +699,13 @@ def save_scan_report(alerts: list[dict], path: str, scan_profile: str = "baselin
             "spider_max_depth": SPIDER_MAX_DEPTH,
             "spider_max_children": SPIDER_MAX_CHILDREN,
             "ajax_spider_max_duration_mins": AJAX_SPIDER_MAX_DURATION_MINS,
+            "ajax_spider_number_of_browsers": AJAX_SPIDER_BROWSERS,
             "active_scan_threads_per_host": ACTIVE_SCAN_THREADS_PER_HOST,
             "active_scan_max_rule_duration_mins": 0,
             "active_scan_max_duration_mins": 0,
             "active_scan_max_alerts_per_rule": 0,
+            "scan_policy": PROFILE_SCAN_POLICIES[scan_profile],
+            "active_scan_input_vectors": ACTIVE_SCAN_INPUT_VECTORS,
         },
         "targets": SCAN_METADATA,
         "quality_summary": {
@@ -557,6 +728,8 @@ def save_scan_report(alerts: list[dict], path: str, scan_profile: str = "baselin
                 ).most_common()
             ],
             "non_noise_alert_count": len(non_noise_alerts),
+            "request_method_populated_count": request_method_populated_count,
+            "request_method_missing_count": len(alerts) - request_method_populated_count,
             "confirmed_evidence_candidates": confirmed_candidates,
             "other_high_medium_findings": other_high_medium,
             "repeated_header_findings": repeated_headers,
@@ -577,17 +750,46 @@ def save_scan_report(alerts: list[dict], path: str, scan_profile: str = "baselin
         json.dump(report, f, indent=2)
     print(f"ZAP scan report saved to {path}")
 
+
+def build_vulnerable_app_benchmark_payload(alerts: list[dict]) -> dict:
+    """Convert enriched raw alerts to VulnerableApp's official DAST schema."""
+    findings, seen = [], set()
+    for alert in alerts:
+        if alert.get("app") != "vulnerable_app":
+            continue
+        cwe = str(alert.get("cweid", "")).strip()
+        wasc = str(alert.get("wascid", "")).strip()
+        method = str(alert.get("request_method", "")).strip().upper()
+        finding = {"url": alert.get("url", "")}
+        if cwe and cwe not in {"0", "-1"}:
+            finding["cwe"] = cwe if cwe.upper().startswith("CWE-") else f"CWE-{cwe}"
+        if wasc and wasc not in {"0", "-1"}:
+            finding["wascId"] = wasc
+        if method:
+            finding["method"] = method
+        key = tuple(sorted(finding.items()))
+        if finding["url"] and key not in seen:
+            seen.add(key)
+            findings.append(finding)
+    return {"tool": "LLM-SEC-ZAP", "scanType": "DAST", "findings": findings}
+
+
+def submit_vulnerable_app_benchmark(payload: dict, endpoint: str = BENCHMARK_ENDPOINT) -> dict:
+    response = session.post(endpoint, json=payload, timeout=(3, 30))
+    response.raise_for_status()
+    return response.json()
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Run the authorized local ZAP DAST scan")
-    parser.add_argument("--scan-profile", choices=SCAN_PROFILES, default="baseline")
+    parser.add_argument("--scan-profile", choices=SCAN_PROFILES, default="benchmark")
     args = parser.parse_args()
     wait_for_zap()
     start_fresh_zap_session()
     reset_scan_metadata()
     all_alerts = []
+    all_alerts += run_scan("http://vulnerable-app:9090/VulnerableApp", "vulnerable_app", args.scan_profile)
     all_alerts += run_scan("http://juice-shop:3000", "juice_shop", args.scan_profile)
-    all_alerts += run_scan("http://dvwa", "dvwa", args.scan_profile)
     save_alerts(all_alerts)
     save_scan_report(all_alerts, "zap_scan_report.json", args.scan_profile)

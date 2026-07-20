@@ -15,11 +15,11 @@ services:
     networks:
       - lab-net
 
-  dvwa:
-    image: vulnerables/web-dvwa
-    container_name: dvwa
+  vulnerable-app:
+    image: sasanlabs/owasp-vulnerableapp:latest
+    container_name: vulnerable-app
     ports:
-      - "8081:80"
+      - "9090:9090"
     networks:
       - lab-net
 
@@ -39,4 +39,4 @@ services:
       -config api.addrs.addr.regex=true
     depends_on:
       - juice-shop
-      - dvwa
+      - vulnerable-app
