@@ -259,6 +259,8 @@ def build_dedup_key(alert: dict) -> dict:
         "url": str(payload.get("url", "")),
         "description": str(payload.get("description", "")),
         "evidence": str(payload.get("evidence", "")),
+        "plugin_id": str(payload.get("plugin_id") or payload.get("pluginid", "")).strip(),
+        "request_method": str(payload.get("request_method", "")).strip().upper(),
     }
 
 

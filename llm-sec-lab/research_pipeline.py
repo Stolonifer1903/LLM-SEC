@@ -68,6 +68,14 @@ GROUND_TRUTH_PATH = LAB_DIR / "ground_truth.csv"
 RULES_PATH = LAB_DIR / "ground_truth_match_rules.csv"
 VALIDATION_PATH = LAB_DIR / "ground_truth_detection_validation.csv"
 EXAMPLES_PATH = LAB_DIR / "few_shot_examples.json"
+GROUND_TRUTH_CANDIDATE_COLUMNS = (
+    "zap_alert_name", "zap_cwe_id", "app", "route_pattern", "evidence_pattern",
+    "status", "provider_key", "request_method", "plugin_id", "evidence_source",
+)
+TRIAGE_RESULT_COLUMNS = (
+    "zap_alert_name", "app", "url", "cwe", "strategy", "llm_verdict",
+    "llm_confidence", "ground_truth_label", "matched_rule", "duplicate_count",
+)
 
 CVSS_CHOICES = {
     "av": {"N", "A", "L", "P"},
@@ -153,8 +161,11 @@ def canonical_alert(alert: dict, alert_id: int) -> dict:
     row["app"] = normalize_text(row.get("app", ""))
     row["alert_name"] = _trim(row.get("alert_name", row.get("alert", "")))
     row["zap_cwe_id"] = normalize_cwe_id(row.get("cweid", row.get("zap_cwe_id", "")))
-    for field in ("risk", "confidence", "url", "description", "evidence", "param", "attack", "other", "pluginid"):
+    for field in ("risk", "confidence", "url", "description", "evidence", "param", "attack", "other", "pluginid", "plugin_id", "evidence_source"):
         row[field] = _trim(row.get(field), 2000 if field in {"description", "evidence", "other"} else 500)
+    row["plugin_id"] = _trim(row.get("plugin_id") or row.get("pluginid", ""))
+    row["pluginid"] = row["plugin_id"]
+    row["request_method"] = _trim(row.get("request_method", "")).upper()
     return row
 
 
@@ -166,6 +177,8 @@ def dedup_key(alert: dict) -> dict:
         "url": alert.get("url", ""), "description": alert.get("description", ""),
         "evidence": alert.get("evidence", ""), "param": alert.get("param", ""),
         "attack": alert.get("attack", ""),
+        "plugin_id": _trim(alert.get("plugin_id") or alert.get("pluginid", "")),
+        "request_method": _trim(alert.get("request_method", "")).upper(),
     }
 
 
@@ -187,6 +200,78 @@ def deduplicate_alerts(alerts: list[dict]) -> list[dict]:
         cluster["dedup_cluster_size"] = len(cluster["members"])
         cluster["alert_ids"] = [member["alert_id"] for member in cluster["members"]]
     return ordered
+
+
+def build_ground_truth_candidates(
+    alerts: list[dict], ground_truth_path: Path = GROUND_TRUTH_PATH,
+) -> list[dict]:
+    """Return strict, review-only candidates supported by official VulnerableApp rows."""
+    ground_truth = load_ground_truth(ground_truth_path)
+    comparators = []
+    for _, row in ground_truth.iterrows():
+        if normalize_text(row.get("app", "")) != "vulnerable_app":
+            continue
+        match = re.fullmatch(
+            r"(?P<route>/.*?)\s+\[(?P<method>[A-Za-z]+)\]\s*",
+            str(row.get("endpoint_or_feature", "")).strip(),
+        )
+        if not match:
+            continue
+        route = normalize_url_path(match.group("route"))
+        if not route.startswith("/VulnerableApp"):
+            route = normalize_url_path(f"/VulnerableApp{route}")
+        comparators.append({
+            "provider_key": str(row.get("challenge_id", row.get("provider_key", ""))).strip(),
+            "route": route,
+            "method": match.group("method").upper(),
+            "cwe": normalize_cwe_id(row.get("cwe_id", "")),
+        })
+
+    candidates, seen = [], set()
+    for alert in alerts:
+        if normalize_text(alert.get("app", "")) != "vulnerable_app":
+            continue
+        attack = str(alert.get("attack", "")).strip()
+        evidence = str(alert.get("evidence", "")).strip()
+        if not attack or not evidence:
+            continue
+        route = normalize_url_path(alert.get("url", ""))
+        method = str(alert.get("request_method", "")).strip().upper()
+        cwe = normalize_cwe_id(alert.get("zap_cwe_id", alert.get("cweid", "")))
+        for comparator in comparators:
+            if (route, method, cwe) != (
+                comparator["route"], comparator["method"], comparator["cwe"],
+            ):
+                continue
+            candidate = {
+                "zap_alert_name": str(alert.get("alert_name", alert.get("alert", ""))).strip(),
+                "zap_cwe_id": cwe,
+                "app": "vulnerable_app",
+                "route_pattern": f"^{re.escape(route)}$",
+                "evidence_pattern": re.escape(evidence),
+                "status": "candidate",
+                "provider_key": comparator["provider_key"],
+                "request_method": method,
+                "plugin_id": str(alert.get("plugin_id") or alert.get("pluginid", "")).strip(),
+                "evidence_source": str(alert.get("evidence_source", "")).strip(),
+            }
+            key = tuple(candidate[column] for column in GROUND_TRUTH_CANDIDATE_COLUMNS)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+    return sorted(
+        candidates,
+        key=lambda row: (
+            row["app"], row["route_pattern"], row["zap_alert_name"],
+            row["zap_cwe_id"], row["evidence_pattern"], row["provider_key"],
+        ),
+    )
+
+
+def write_ground_truth_candidates(alerts: list[dict], path: Path) -> list[dict]:
+    candidates = build_ground_truth_candidates(alerts)
+    pd.DataFrame(candidates, columns=GROUND_TRUTH_CANDIDATE_COLUMNS).to_csv(path, index=False)
+    return candidates
 
 
 def _write_json(path: Path, value: dict | list) -> None:
@@ -698,6 +783,31 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
     _write_json(run_dir / "unmapped_alerts.json", unmapped)
 
     audit_by_id = {row["alert_id"]: row for row in audit}
+    triage_rows, seen_cluster_strategies = [], set()
+    for strategy in STRATEGIES:
+        for record in records:
+            if record.get("prompt_strategy") != strategy:
+                continue
+            key = (str(record.get("cluster_id", "")), strategy)
+            if key in seen_cluster_strategies:
+                continue
+            seen_cluster_strategies.add(key)
+            match = audit_by_id[str(record["alert_id"])]
+            triage_rows.append({
+                "zap_alert_name": record.get("alert_name", ""),
+                "app": record.get("app", ""),
+                "url": record.get("url", ""),
+                "cwe": record.get("zap_cwe_id", record.get("cweid", "")),
+                "strategy": strategy,
+                "llm_verdict": record.get("confirmed", ""),
+                "llm_confidence": record.get("confidence", ""),
+                "ground_truth_label": match["ground_truth_label"],
+                "matched_rule": match["matched_rule_id"],
+                "duplicate_count": record.get("dedup_cluster_size", 1),
+            })
+    pd.DataFrame(triage_rows, columns=TRIAGE_RESULT_COLUMNS).to_csv(
+        run_dir / "triage_results.csv", index=False,
+    )
     parsed_rates = {strategy: diagnostics["strategies"][strategy]["parse_success_rate"] for strategy in STRATEGIES}
     parse_blocked = [strategy for strategy, rate in parsed_rates.items() if rate < PARSE_SUCCESS_THRESHOLD]
     cluster_labels: dict[str, bool] = {}
@@ -839,6 +949,7 @@ def scan_and_run(
     run_dir.mkdir(parents=True, exist_ok=False)
     canonical = [canonical_alert(alert, index) for index, alert in enumerate(alerts)]
     _write_json(run_dir / "raw_alerts.json", canonical)
+    write_ground_truth_candidates(canonical, run_dir / "ground_truth_candidates.csv")
     save_scan_report(alerts, str(run_dir / "zap_scan_report.json"), scan_profile=scan_profile)
     print(
         f"[zap] Scan complete: {len(alerts)} raw alerts across {len(target_items)} targets.",

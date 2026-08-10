@@ -104,12 +104,14 @@ class DedupAndInferenceTests(unittest.TestCase):
         exact_copy = {**base, "alert_id": 1}
         other_evidence = {**base, "alert_id": 2, "evidence": "1777777777"}
         other_url = {**base, "alert_id": 3, "url": "http://juice-shop:3000/main.js"}
+        other_method = {**base, "alert_id": 4, "request_method": "POST"}
+        other_plugin = {**base, "alert_id": 5, "pluginid": "40026"}
 
         clusters = run_pipeline.deduplicate_alerts(
-            [base, exact_copy, other_evidence, other_url]
+            [base, exact_copy, other_evidence, other_url, other_method, other_plugin]
         )
 
-        self.assertEqual(len(clusters), 3)
+        self.assertEqual(len(clusters), 5)
         self.assertEqual(len(clusters[0]["members"]), 2)
         self.assertNotEqual(clusters[0]["key_token"], clusters[1]["key_token"])
         self.assertNotEqual(clusters[0]["key_token"], clusters[2]["key_token"])

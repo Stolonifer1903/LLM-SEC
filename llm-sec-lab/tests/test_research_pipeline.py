@@ -58,6 +58,46 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
         self.assertEqual(clusters[0]["dedup_cluster_size"], 2)
         self.assertNotEqual(clusters[0]["cluster_id"], clusters[1]["cluster_id"])
 
+    def test_dedup_separates_http_methods_and_zap_plugins(self):
+        base = self.alert(0)
+        same = {**base, "alert_id": "1"}
+        different_method = {**base, "alert_id": "2", "request_method": "POST"}
+        different_plugin = {**base, "alert_id": "3", "pluginid": "40026", "plugin_id": "40026"}
+        clusters = pipeline.deduplicate_alerts([base, same, different_method, different_plugin])
+        self.assertEqual(len(clusters), 3)
+        self.assertEqual(clusters[0]["dedup_cluster_size"], 2)
+
+    def test_ground_truth_candidates_require_official_route_method_cwe_and_evidence(self):
+        alert = pipeline.canonical_alert({
+            "app": "vulnerable_app",
+            "alert_name": "Cross Site Scripting (Reflected)",
+            "url": "http://target/VulnerableApp/XSSWithHtmlTagInjection/LEVEL_1?input=zap_seed",
+            "cweid": "79",
+            "request_method": "GET",
+            "pluginid": "40012",
+            "attack": "<script>alert(1)</script>",
+            "evidence": "<script>alert(1)</script>",
+            "evidence_source": "native",
+        }, 0)
+        candidates = pipeline.build_ground_truth_candidates([alert])
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["status"], "candidate")
+        self.assertEqual(candidates[0]["plugin_id"], "40012")
+        self.assertEqual(
+            candidates[0]["route_pattern"],
+            r"^/VulnerableApp/XSSWithHtmlTagInjection/LEVEL_1$",
+        )
+        self.assertTrue(candidates[0]["provider_key"].startswith("VULNERABLE_APP-REFLECTED_XSS"))
+        self.assertIsNotNone(__import__("re").compile(candidates[0]["evidence_pattern"]).search(alert["evidence"]))
+        self.assertEqual(
+            pipeline.build_ground_truth_candidates([{**alert, "request_method": "POST"}]),
+            [],
+        )
+        self.assertEqual(
+            pipeline.build_ground_truth_candidates([{**alert, "evidence": ""}]),
+            [],
+        )
+
     def test_bundled_examples_are_generic_balanced_and_source_cited(self):
         rows = json.loads(pipeline._load_examples())
         self.assertEqual(len(rows), 4)
@@ -125,12 +165,14 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
             ):
                 result = pipeline.scan_and_run(run_dir, "baseline", scan_only=True)
                 raw_alerts_exists = (run_dir / "raw_alerts.json").exists()
+                candidates_exists = (run_dir / "ground_truth_candidates.csv").exists()
 
         self.assertTrue(result["scan_only"])
         self.assertEqual(scan.call_count, 2)
         save_report.assert_called_once()
         triage.assert_not_called()
         self.assertTrue(raw_alerts_exists)
+        self.assertTrue(candidates_exists)
 
     def test_scan_order_is_vulnerable_app_then_juice_shop(self):
         alerts = [{"app": "vulnerable_app", "alert_name": "Example", "url": "http://target/"}]
@@ -222,6 +264,10 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
             self.assertTrue((run_dir / "unmapped_alerts.json").exists())
             self.assertTrue((run_dir / "evaluation_summary.json").exists())
             self.assertTrue((run_dir / "evaluation_results.csv").exists())
+            triage = pipeline.pd.read_csv(run_dir / "triage_results.csv")
+            self.assertEqual(list(triage.columns), list(pipeline.TRIAGE_RESULT_COLUMNS))
+            self.assertEqual(len(triage), len(pipeline.STRATEGIES))
+            self.assertEqual(set(triage["duplicate_count"]), {1})
 
     def test_parse_failure_never_becomes_safe_prediction(self):
         clusters = pipeline.deduplicate_alerts([self.alert(0)])
