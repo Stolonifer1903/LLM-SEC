@@ -17,6 +17,8 @@ SPIDER_MAX_CHILDREN = int(os.getenv("ZAP_SPIDER_MAX_CHILDREN", "0"))
 AJAX_SPIDER_MAX_DURATION_MINS = int(os.getenv("ZAP_AJAX_MAX_DURATION_MINS", "0"))
 AJAX_SPIDER_BROWSERS = int(os.getenv("ZAP_AJAX_BROWSERS", "4"))
 ACTIVE_SCAN_THREADS_PER_HOST = int(os.getenv("ZAP_ACTIVE_THREADS_PER_HOST", "4"))
+ACTIVE_SCAN_INJECTABLE_TARGETS = 31  # Query, POST, path, headers, and cookies.
+ACTIVE_SCAN_STRUCTURED_HANDLERS = 7  # Multipart, XML, and JSON.
 BENCHMARK_ENDPOINT = os.getenv(
     "VULNERABLE_APP_BENCHMARK_URL",
     "http://localhost:9090/VulnerableApp/scanner/benchmark",
@@ -66,6 +68,7 @@ TARGET_PROFILES = {
     },
 }
 SCAN_METADATA = []
+ZAP_VERSION = ""
 SCAN_PROFILES = ("benchmark", "baseline", "targeted")
 TARGETED_SCANNER_IDS = (6, 20019, 40012, 40014, 40017, 40018, 40019, 40020, 40021, 40022, 40026, 40027, 90020, 90037)
 NOISE_SCANNER_ID = 10104
@@ -84,6 +87,31 @@ ACTIVE_SCAN_INPUT_VECTORS = {
     "http_headers_all_requests": True,
     "cookies": True,
     "scripts": True,
+}
+FOCUSED_SCAN_POLICIES = {
+    "LLM-SEC-Reflected-XSS": (40012,),
+    "LLM-SEC-DOM-XSS": (40026,),
+    "LLM-SEC-SQLi": (40018, 40019),
+}
+FOCUSED_POLICY_SNAPSHOTS = {}
+FOCUSED_SCAN_REQUESTS = {
+    "vulnerable_app": [
+        {"url": "/XSSWithHtmlTagInjection/LEVEL_1?input=zap_seed", "method": "GET", "policy": "LLM-SEC-Reflected-XSS"},
+        {"url": "/XSSWithHtmlTagInjection/LEVEL_2?input=zap_seed", "method": "GET", "policy": "LLM-SEC-Reflected-XSS"},
+        {"url": "/XSSWithHtmlTagInjection/LEVEL_3?input=zap_seed", "method": "GET", "policy": "LLM-SEC-Reflected-XSS"},
+        {"url": "/XSSInImgTagAttribute/LEVEL_1?input=zap_seed", "method": "GET", "policy": "LLM-SEC-Reflected-XSS"},
+        {"url": "/XSSInImgTagAttribute/LEVEL_2?input=zap_seed", "method": "GET", "policy": "LLM-SEC-Reflected-XSS"},
+        {"url": "/ErrorBasedSQLInjectionVulnerability/LEVEL_1?id=1", "method": "GET", "policy": "LLM-SEC-SQLi"},
+        {"url": "/ErrorBasedSQLInjectionVulnerability/LEVEL_2?id=1", "method": "GET", "policy": "LLM-SEC-SQLi"},
+        {"url": "/BlindSQLInjectionVulnerability/LEVEL_1?id=1", "method": "GET", "policy": "LLM-SEC-SQLi"},
+        {"url": "/BlindSQLInjectionVulnerability/LEVEL_2?id=1", "method": "GET", "policy": "LLM-SEC-SQLi"},
+        {"url": "/UnionBasedSQLInjectionVulnerability/LEVEL_1?id=1", "method": "GET", "policy": "LLM-SEC-SQLi"},
+        {"url": "/UnionBasedSQLInjectionVulnerability/LEVEL_2?id=1", "method": "GET", "policy": "LLM-SEC-SQLi"},
+    ],
+    "juice_shop": [
+        {"url": "/rest/products/search?q=apple", "method": "GET", "policy": "LLM-SEC-SQLi"},
+        {"url": "/#/search?q=apple", "method": "GET", "policy": "LLM-SEC-DOM-XSS", "browser_warm": True},
+    ],
 }
 TARGETED_REQUESTS = {
     "juice_shop": [
@@ -130,6 +158,8 @@ def configure_active_scan(scan_profile: str = "benchmark") -> list[dict]:
     zap_api("ascan", "action", "setOptionAddQueryParam", Boolean="true")
     zap_api("ascan", "action", "setOptionScanHeadersAllRequests", Boolean="true")
     zap_api("ascan", "action", "setOptionInjectPluginIdInHeader", Boolean="true")
+    zap_api("ascan", "action", "setOptionTargetParamsInjectable", Integer=ACTIVE_SCAN_INJECTABLE_TARGETS)
+    zap_api("ascan", "action", "setOptionTargetParamsEnabledRPC", Integer=ACTIVE_SCAN_STRUCTURED_HANDLERS)
     # ZAP 2.17 exposes separate enable/disable actions rather than a
     # setScannerEnabled action.
     if scan_profile == "benchmark":
@@ -183,6 +213,59 @@ def configure_active_scan(scan_profile: str = "benchmark") -> list[dict]:
     ).get("scanners", [])
 
 
+def configure_focused_scan_policies() -> dict[str, list[dict]]:
+    """Recreate narrow high-signal policies so persisted ZAP state cannot leak in."""
+    snapshots = {}
+    for policy_name, scanner_ids in FOCUSED_SCAN_POLICIES.items():
+        try:
+            zap_api("ascan", "action", "removeScanPolicy", scanPolicyName=policy_name)
+        except requests.RequestException:
+            pass
+        zap_api("ascan", "action", "addScanPolicy", scanPolicyName=policy_name)
+        zap_api("ascan", "action", "disableAllScanners", scanPolicyName=policy_name)
+        ids = ",".join(str(scanner_id) for scanner_id in scanner_ids)
+        zap_api("ascan", "action", "enableScanners", ids=ids, scanPolicyName=policy_name)
+        for scanner_id in scanner_ids:
+            zap_api(
+                "ascan", "action", "setScannerAttackStrength",
+                id=str(scanner_id), attackStrength="HIGH", scanPolicyName=policy_name,
+            )
+            zap_api(
+                "ascan", "action", "setScannerAlertThreshold",
+                id=str(scanner_id), alertThreshold="LOW", scanPolicyName=policy_name,
+            )
+        scanners = zap_api(
+            "ascan", "view", "scanners", scanPolicyName=policy_name,
+        ).get("scanners", [])
+        installed = {
+            str(scanner.get("id", "")).strip(): scanner for scanner in scanners
+            if str(scanner.get("id", "")).strip()
+        }
+        missing = sorted(set(ids.split(",")) - set(installed))
+        if missing:
+            raise RuntimeError(
+                f"Focused scan policy {policy_name} is missing required ZAP plugins: {missing}"
+            )
+        disabled = sorted(
+            scanner_id for scanner_id in ids.split(",")
+            if str(installed[scanner_id].get("enabled", "")).strip().lower() != "true"
+        )
+        if disabled:
+            raise RuntimeError(
+                f"Focused scan policy {policy_name} did not enable required ZAP plugins: {disabled}"
+            )
+        snapshots[policy_name] = scanners
+    FOCUSED_POLICY_SNAPSHOTS.clear()
+    FOCUSED_POLICY_SNAPSHOTS.update(snapshots)
+    return snapshots
+
+
+def ensure_focused_scan_policies() -> dict[str, list[dict]]:
+    if not FOCUSED_POLICY_SNAPSHOTS:
+        return configure_focused_scan_policies()
+    return FOCUSED_POLICY_SNAPSHOTS
+
+
 def configure_spider() -> None:
     zap_api("spider", "action", "setOptionMaxDepth", Integer=SPIDER_MAX_DEPTH)
     zap_api("spider", "action", "setOptionMaxChildren", Integer=SPIDER_MAX_CHILDREN)
@@ -234,6 +317,7 @@ def scan_id_from_response(response: dict, action: str, scan_label: str) -> str:
     )
 
 def wait_for_zap(timeout=60):
+    global ZAP_VERSION
     start = time.time()
     last_error = None
     while time.time() - start < timeout:
@@ -242,7 +326,8 @@ def wait_for_zap(timeout=60):
             response.raise_for_status()
             # Do not begin a scan until the JavaScript-aware crawler add-on is ready.
             zap_api("ajaxSpider", "view", "status")
-            print("ZAP is running, version:", response.json().get('version'))
+            ZAP_VERSION = str(response.json().get("version", ""))
+            print("ZAP is running, version:", ZAP_VERSION)
             return True
         except Exception as exc:
             last_error = exc
@@ -329,7 +414,17 @@ def _vulnerable_app_seed_specs(target_url: str) -> list[dict]:
             # A benign parameter gives active rules a concrete input vector on
             # routes whose templates consume arbitrary query/body parameters.
             if method == "GET":
-                specs.append({"method": method, "url": f"{target_url}{route}?zap_seed=1", "body": "", "content_type": ""})
+                if name in {
+                    "BlindSQLInjectionVulnerability",
+                    "ErrorBasedSQLInjectionVulnerability",
+                    "UnionBasedSQLInjectionVulnerability",
+                }:
+                    query = "id=1"
+                elif name in {"XSSWithHtmlTagInjection", "XSSInImgTagAttribute"}:
+                    query = "input=zap_seed"
+                else:
+                    query = "zap_seed=1"
+                specs.append({"method": method, "url": f"{target_url}{route}?{query}", "body": "", "content_type": ""})
             elif name == "XXEVulnerability":
                 specs.append({
                     "method": method, "url": f"{target_url}{route}",
@@ -429,6 +524,86 @@ def run_targeted_active_scans(
     return scan_ids
 
 
+def _seed_focused_request(url: str, method: str) -> dict:
+    """Put the exact parameterized request in ZAP history before selecting it."""
+    spec = {"url": url, "method": method, "body": "", "content_type": ""}
+    try:
+        zap_api(
+            "core", "action", "sendRequest",
+            request=_raw_seed_request(spec), followRedirects="true",
+        )
+        return {"url": url, "method": method, "success": True, "error": ""}
+    except requests.RequestException as exc:
+        return {"url": url, "method": method, "success": False, "error": str(exc)}
+
+
+def run_focused_active_scans(
+    target_url: str,
+    scan_label: str,
+    context: dict,
+) -> list[dict]:
+    """Run narrow, reproducible high-signal scans after the broad active scan."""
+    ensure_focused_scan_policies()
+    results = []
+    for request_spec in FOCUSED_SCAN_REQUESTS[scan_label]:
+        url = f"{target_url}{request_spec['url']}"
+        browser_warmed = False
+        if request_spec.get("browser_warm"):
+            browser_warmed = run_client_spider(url, context, scan_label)
+            seed = {
+                "url": url, "method": request_spec["method"],
+                "success": browser_warmed,
+                "error": "" if browser_warmed else "Client spider did not complete",
+            }
+        else:
+            seed = _seed_focused_request(url, request_spec["method"])
+
+        is_dom_scan = request_spec["policy"] == "LLM-SEC-DOM-XSS"
+        if is_dom_scan:
+            zap_api("ascan", "action", "setOptionThreadPerHost", Integer=1)
+        try:
+            response = zap_api(
+                "ascan", "action", "scan",
+                url=url,
+                recurse="false",
+                inScopeOnly="true",
+                scanPolicyName=request_spec["policy"],
+                method=request_spec["method"],
+                postData="",
+                contextId=context["id"],
+            )
+            scan_id = scan_id_from_response(response, "scan", scan_label)
+            wait_for_progress(
+                lambda current_id: zap_api(
+                    "ascan", "view", "status", scanId=current_id,
+                )["status"],
+                scan_id,
+                f"Focused {request_spec['policy']} scan {request_spec['url']}",
+                5,
+            )
+            try:
+                progress = zap_api("ascan", "view", "scanProgress", scanId=scan_id)
+            except requests.RequestException as exc:
+                progress = {"error": str(exc)}
+            results.append({
+                "url": url,
+                "method": request_spec["method"],
+                "policy": request_spec["policy"],
+                "scan_id": scan_id,
+                "status": "complete",
+                "seed": seed,
+                "browser_warmed": browser_warmed,
+                "scan_progress": progress,
+            })
+        finally:
+            if is_dom_scan:
+                zap_api(
+                    "ascan", "action", "setOptionThreadPerHost",
+                    Integer=ACTIVE_SCAN_THREADS_PER_HOST,
+                )
+    return results
+
+
 def start_fresh_zap_session() -> None:
     """Prevent prior aborted scans from contaminating discovery or exhausting ZAP."""
     # ZAP serializes session disposal and database creation. A large completed
@@ -438,6 +613,7 @@ def start_fresh_zap_session() -> None:
         "core", "action", "newSession", name="", overwrite="true",
         request_timeout=SESSION_RESET_TIMEOUT,
     )
+    FOCUSED_POLICY_SNAPSHOTS.clear()
 
 
 def wait_for_ajax_spider(timeout=None) -> None:
@@ -517,6 +693,16 @@ def _request_method(message_id) -> str:
     return first_line.split(" ", 1)[0].upper() if " " in first_line else ""
 
 
+def _normalise_alert_evidence(alert: dict) -> tuple[str, str]:
+    """Use ZAP's DOM reproduction steps when rule 40026 omits evidence."""
+    plugin_id = alert.get("pluginId", alert.get("pluginid"))
+    native_evidence = str(alert.get("evidence", "") or "")
+    other = str(alert.get("other", "") or "")
+    if str(plugin_id) == "40026" and not native_evidence.strip() and other.strip():
+        return other, "other"
+    return native_evidence, "native" if native_evidence.strip() else ""
+
+
 def run_scan(target_url: str, scan_label: str, scan_profile: str = "benchmark") -> list[dict]:
     if scan_label not in TARGET_PROFILES:
         raise ValueError(f"No DAST target profile configured for {scan_label}")
@@ -524,6 +710,7 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "benchmark") 
         raise ValueError(f"Unknown scan profile: {scan_profile}")
     scan_policy = PROFILE_SCAN_POLICIES[scan_profile]
     scan_started_at = datetime.now(timezone.utc)
+    focused_policy_snapshots = ensure_focused_scan_policies()
     configure_spider()
     scanner_snapshot = configure_active_scan(scan_profile)
     context = create_context(target_url, scan_label)
@@ -605,6 +792,10 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "benchmark") 
     )
     print(f"\n[{scan_label}] Active scan complete.")
 
+    print(f"[{scan_label}] Starting high-signal XSS/SQLi focused scans.")
+    focused_scans = run_focused_active_scans(target_url, scan_label, context)
+    print(f"[{scan_label}] High-signal focused scans complete.")
+
     targeted_scans = []
     if scan_profile == "targeted":
         print(f"[{scan_label}] Starting focused targeted active scans.")
@@ -615,6 +806,9 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "benchmark") 
     raw_alerts = zap_api("core", "view", "alerts", baseurl=target_url)["alerts"]
     alerts = []
     for a in raw_alerts:
+        plugin_id = a.get("pluginId", a.get("pluginid"))
+        other = str(a.get("other", "") or "")
+        evidence, evidence_source = _normalise_alert_evidence(a)
         alerts.append({
             "app": scan_label,
             "alert_name": a.get("alert", ""),
@@ -625,11 +819,13 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "benchmark") 
             "solution": a.get("solution", ""),
             "cweid": a.get("cweid", ""),
             "wascid": a.get("wascid", ""),
-            "evidence": a.get("evidence", ""),
-            "pluginid": a.get("pluginId", a.get("pluginid")),
+            "evidence": evidence,
+            "evidence_source": evidence_source,
+            "pluginid": plugin_id,
+            "plugin_id": plugin_id,
             "param": a.get("param", ""),
             "attack": a.get("attack", ""),
-            "other": a.get("other", ""),
+            "other": other,
             "tags": a.get("tags", {}),
             "message_id": a.get("messageId", a.get("messageid")),
             "request_method": _request_method(a.get("messageId", a.get("messageid"))),
@@ -642,6 +838,8 @@ def run_scan(target_url: str, scan_label: str, scan_profile: str = "benchmark") 
         "authenticated_user_id": user_id,
         "scan_profile": scan_profile,
         "effective_scanners": scanner_snapshot,
+        "focused_scan_policies": focused_policy_snapshots,
+        "focused_scans": focused_scans,
         "targeted_scans": targeted_scans,
         "benchmark_route_seeds": seed_summary,
         "client_spider_completed": client_spider_completed,
@@ -692,8 +890,14 @@ def save_scan_report(alerts: list[dict], path: str, scan_profile: str = "baselin
         }
     ]
     request_method_populated_count = sum(bool(alert.get("request_method")) for alert in alerts)
+    high_signal_plugin_ids = {"40012", "40026", "40018", "40019"}
+    high_signal_alerts = [
+        alert for alert in alerts
+        if str(alert.get("plugin_id", alert.get("pluginid", ""))) in high_signal_plugin_ids
+    ]
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "zap_version": ZAP_VERSION,
         "scanner_configuration": {
             "scan_profile": scan_profile,
             "spider_max_depth": SPIDER_MAX_DEPTH,
@@ -706,6 +910,11 @@ def save_scan_report(alerts: list[dict], path: str, scan_profile: str = "baselin
             "active_scan_max_alerts_per_rule": 0,
             "scan_policy": PROFILE_SCAN_POLICIES[scan_profile],
             "active_scan_input_vectors": ACTIVE_SCAN_INPUT_VECTORS,
+            "active_scan_injectable_targets": ACTIVE_SCAN_INJECTABLE_TARGETS,
+            "active_scan_structured_handlers": ACTIVE_SCAN_STRUCTURED_HANDLERS,
+            "focused_scan_policies": {
+                name: list(scanner_ids) for name, scanner_ids in FOCUSED_SCAN_POLICIES.items()
+            },
         },
         "targets": SCAN_METADATA,
         "quality_summary": {
@@ -733,6 +942,27 @@ def save_scan_report(alerts: list[dict], path: str, scan_profile: str = "baselin
             "confirmed_evidence_candidates": confirmed_candidates,
             "other_high_medium_findings": other_high_medium,
             "repeated_header_findings": repeated_headers,
+            "high_signal_plugins": [
+                {
+                    "plugin_id": plugin_id,
+                    "alert_count": sum(
+                        str(alert.get("plugin_id", alert.get("pluginid", ""))) == plugin_id
+                        for alert in high_signal_alerts
+                    ),
+                    "attack_and_evidence_count": sum(
+                        str(alert.get("plugin_id", alert.get("pluginid", ""))) == plugin_id
+                        and bool(str(alert.get("attack", "")).strip())
+                        and bool(str(alert.get("evidence", "")).strip())
+                        for alert in high_signal_alerts
+                    ),
+                }
+                for plugin_id in sorted(high_signal_plugin_ids)
+            ],
+            "dom_evidence_source_counts": dict(Counter(
+                alert.get("evidence_source", "")
+                for alert in high_signal_alerts
+                if str(alert.get("plugin_id", alert.get("pluginid", ""))) == "40026"
+            )),
         },
         "alert_family_counts": [
             {

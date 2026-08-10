@@ -30,11 +30,49 @@ class ZapScannerConfigurationTests(unittest.TestCase):
             for call in api.call_args_list
         ))
         self.assertTrue(any(
+            call.args[:3] == ("ascan", "action", "setOptionTargetParamsInjectable")
+            and call.kwargs.get("Integer") == zap_scanner.ACTIVE_SCAN_INJECTABLE_TARGETS
+            for call in api.call_args_list
+        ))
+        self.assertTrue(any(
+            call.args[:3] == ("ascan", "action", "setOptionTargetParamsEnabledRPC")
+            and call.kwargs.get("Integer") == zap_scanner.ACTIVE_SCAN_STRUCTURED_HANDLERS
+            for call in api.call_args_list
+        ))
+        self.assertTrue(any(
             call.args[:3] == ("ascan", "action", "setOptionAddQueryParam")
             and call.kwargs.get("Boolean") == "true"
             for call in api.call_args_list
         ))
 
+    def test_focused_policies_are_recreated_with_only_required_rules(self):
+        installed = [{"id": str(value), "enabled": "true"} for value in (40012, 40026, 40018, 40019)]
+
+        def policy_api(_component, _kind, endpoint, **_params):
+            return {"scanners": installed} if endpoint == "scanners" else {"Result": "OK"}
+
+        with patch.object(zap_scanner, "zap_api", side_effect=policy_api) as api:
+            snapshots = zap_scanner.configure_focused_scan_policies()
+
+        self.assertEqual(set(snapshots), set(zap_scanner.FOCUSED_SCAN_POLICIES))
+        for policy_name, scanner_ids in zap_scanner.FOCUSED_SCAN_POLICIES.items():
+            self.assertTrue(any(
+                call.args[:3] == ("ascan", "action", "removeScanPolicy")
+                and call.kwargs.get("scanPolicyName") == policy_name
+                for call in api.call_args_list
+            ))
+            self.assertTrue(any(
+                call.args[:3] == ("ascan", "action", "disableAllScanners")
+                and call.kwargs.get("scanPolicyName") == policy_name
+                for call in api.call_args_list
+            ))
+            expected_ids = ",".join(str(value) for value in scanner_ids)
+            self.assertTrue(any(
+                call.args[:3] == ("ascan", "action", "enableScanners")
+                and call.kwargs.get("ids") == expected_ids
+                and call.kwargs.get("scanPolicyName") == policy_name
+                for call in api.call_args_list
+            ))
     def test_benchmark_profile_applies_high_low_to_every_non_noise_rule(self):
         scanners = [
             {"id": "6", "name": "Path Traversal"},
@@ -314,6 +352,69 @@ class ZapScannerConfigurationTests(unittest.TestCase):
         self.assertTrue(any("GET /VulnerableApp/Example/LEVEL_1?zap_seed=1" in request for request in raw_requests))
         self.assertTrue(any("POST /VulnerableApp/Example/LEVEL_2" in request and "username=zap_seed" in request for request in raw_requests))
         self.assertTrue(any("Content-Type: application/xml" in request and "<zapSeed>" in request for request in raw_requests))
+
+    def test_vulnerable_app_high_signal_seeds_use_real_parameter_names(self):
+        catalogue = [{
+            "Name": "ErrorBasedSQLInjectionVulnerability",
+            "Detailed Information": [{"Level": "LEVEL_1", "HttpMethod": "GET"}],
+        }, {
+            "Name": "XSSWithHtmlTagInjection",
+            "Detailed Information": [{"Level": "LEVEL_1", "HttpMethod": "GET"}],
+        }]
+        fake_response = type("Response", (), {"json": lambda self: catalogue, "raise_for_status": lambda self: None})()
+        with (
+            patch.object(zap_scanner.session, "get", return_value=fake_response),
+            patch.object(zap_scanner, "zap_api") as api,
+        ):
+            zap_scanner.seed_vulnerable_app_requests("http://target/VulnerableApp")
+        raw_requests = [call.kwargs["request"] for call in api.call_args_list]
+        self.assertTrue(any("ErrorBasedSQLInjectionVulnerability/LEVEL_1?id=1" in request for request in raw_requests))
+        self.assertTrue(any("XSSWithHtmlTagInjection/LEVEL_1?input=zap_seed" in request for request in raw_requests))
+
+    def test_focused_scan_uses_exact_request_policy_and_non_recursive_mode(self):
+        request = {
+            "url": "/ErrorBasedSQLInjectionVulnerability/LEVEL_1?id=1",
+            "method": "GET",
+            "policy": "LLM-SEC-SQLi",
+        }
+
+        def focused_api(_component, kind, endpoint, **_params):
+            if kind == "action" and endpoint == "scan":
+                return {"scan": "21"}
+            if kind == "view" and endpoint == "scanProgress":
+                return {"scanProgress": []}
+            return {"Result": "OK"}
+
+        with (
+            patch.dict(zap_scanner.FOCUSED_SCAN_REQUESTS, {"vulnerable_app": [request]}),
+            patch.object(zap_scanner, "ensure_focused_scan_policies"),
+            patch.object(zap_scanner, "_seed_focused_request", return_value={"success": True}),
+            patch.object(zap_scanner, "wait_for_progress"),
+            patch.object(zap_scanner, "zap_api", side_effect=focused_api) as api,
+        ):
+            results = zap_scanner.run_focused_active_scans(
+                "http://target/VulnerableApp", "vulnerable_app", {"id": "3", "name": "ctx"},
+            )
+        scan_call = next(call for call in api.call_args_list if call.args[:3] == ("ascan", "action", "scan"))
+        self.assertEqual(scan_call.kwargs["scanPolicyName"], "LLM-SEC-SQLi")
+        self.assertEqual(scan_call.kwargs["recurse"], "false")
+        self.assertEqual(scan_call.kwargs["method"], "GET")
+        self.assertEqual(scan_call.kwargs["contextId"], "3")
+        self.assertEqual(results[0]["status"], "complete")
+
+    def test_dom_evidence_uses_zap_other_info_only_when_native_evidence_is_empty(self):
+        evidence, source = zap_scanner._normalise_alert_evidence({
+            "pluginId": "40026", "evidence": "", "other": "Browser reproduction steps",
+        })
+        self.assertEqual((evidence, source), ("Browser reproduction steps", "other"))
+        evidence, source = zap_scanner._normalise_alert_evidence({
+            "pluginId": "40026", "evidence": "native", "other": "steps",
+        })
+        self.assertEqual((evidence, source), ("native", "native"))
+        evidence, source = zap_scanner._normalise_alert_evidence({
+            "pluginId": "40012", "evidence": "", "other": "not evidence",
+        })
+        self.assertEqual((evidence, source), ("", ""))
 
     def test_scan_report_includes_effective_configuration_and_alerts(self):
         alerts = [{
