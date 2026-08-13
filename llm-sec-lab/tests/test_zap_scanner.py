@@ -2,23 +2,182 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import zap_scanner
 
 
 class ZapScannerConfigurationTests(unittest.TestCase):
-    def test_thorough_active_scan_configuration_removes_caps(self):
+    def test_final_profile_has_unlimited_caps_pruned_rules_and_medium_strength(self):
+        scanners = [
+            {"id": "40018", "enabled": "true"},
+            {"id": "40019", "enabled": "false"},
+        ]
+        with patch.object(zap_scanner, "zap_api", return_value={"scanners": scanners}) as api:
+            zap_scanner.configure_active_scan("final", "juice_shop")
+        calls = api.call_args_list
+        self.assertTrue(any(
+            call.args[:3] == ("ascan", "action", "setOptionMaxRuleDurationInMins")
+            and call.kwargs.get("Integer") == 0 for call in calls
+        ))
+        self.assertTrue(any(
+            call.args[:3] == ("ascan", "action", "setOptionMaxScanDurationInMins")
+            and call.kwargs.get("Integer") == 0 for call in calls
+        ))
+        self.assertTrue(any(
+            call.args[:3] == ("ascan", "action", "setOptionScanHeadersAllRequests")
+            and call.kwargs.get("Boolean") == "false" for call in calls
+        ))
+        disabled = next(
+            call.kwargs["ids"] for call in calls
+            if call.args[:3] == ("ascan", "action", "disableScanners")
+        )
+        self.assertEqual(set(disabled.split(",")), {"40019"})
+        self.assertTrue({40019, 40026, 90029}.issubset(set(zap_scanner.FINAL_DISABLED_SCANNER_IDS)))
+        self.assertTrue(any(
+            call.args[:3] == ("ascan", "action", "setScannerAttackStrength")
+            and call.kwargs.get("id") == "40018"
+            and call.kwargs.get("attackStrength") == "MEDIUM" for call in calls
+        ))
+
+    def test_active_watchdog_stops_only_after_no_progress(self):
+        stop = Mock()
+        outcome = zap_scanner.wait_for_progress(
+            lambda _scan_id: "99", "7", "Active scan", 0,
+            timeout_seconds=None, stop_scan=stop,
+            get_progress_snapshot=lambda _scan_id: {"scanProgress": [["40018", "1", "5"]]},
+            stall_seconds=-1,
+        )
+        self.assertEqual(outcome["status"], "stalled")
+        self.assertTrue(outcome["progress_snapshots"])
+        stop.assert_called_once_with("7")
+
+    def test_authenticated_configuration_does_not_return_password(self):
+        def api_response(_component, _kind, endpoint, **_params):
+            return {"userId": "4"} if endpoint == "newUser" else {"Result": "OK"}
+        with (
+            patch.dict("os.environ", {
+                "JUICE_SHOP_AUTH_EMAIL": "zap@example.test",
+                "JUICE_SHOP_AUTH_PASSWORD": "top-secret",
+            }),
+            patch.object(zap_scanner, "zap_api", side_effect=api_response) as api,
+        ):
+            result = zap_scanner.configure_juice_shop_authentication(
+                "http://juice-shop:3000", {"id": "3", "name": "ctx"},
+            )
+        self.assertNotIn("top-secret", json.dumps(result))
+        self.assertEqual(result["user_id"], "4")
+        self.assertEqual(result["session_management"], "autoDetectSessionManagement")
+        self.assertTrue(any(
+            call.args[:3] == ("sessionManagement", "action", "setSessionManagementMethod")
+            and call.kwargs.get("methodName") == "autoDetectSessionManagement"
+            for call in api.call_args_list
+        ))
+
+    def test_final_juice_shop_disables_client_spider(self):
+        self.assertFalse(zap_scanner.TARGET_PROFILES["juice_shop"]["final_use_client_spider"])
+
+    def test_progress_deadline_stops_scan_and_returns_timeout(self):
+        stop = Mock()
+        outcome = zap_scanner.wait_for_progress(
+            lambda _scan_id: "99", "7", "Client spider", 0,
+            timeout_seconds=-1, stop_scan=stop,
+        )
+        self.assertEqual(outcome["status"], "timed_out")
+        self.assertEqual(outcome["progress"], 99)
+        stop.assert_called_once_with("7")
+
+    def test_progress_interrupt_stops_known_scan(self):
+        stop = Mock()
+        with self.assertRaises(KeyboardInterrupt):
+            zap_scanner.wait_for_progress(
+                Mock(side_effect=KeyboardInterrupt), "8", "Client spider", 0,
+                timeout_seconds=1, stop_scan=stop,
+            )
+        stop.assert_called_once_with("8")
+
+    def test_client_spider_configuration_is_bounded(self):
+        with patch.object(zap_scanner, "zap_api") as api:
+            zap_scanner.configure_client_spider()
+        self.assertTrue(any(
+            call.args[:3] == ("clientSpider", "action", "setOptionMaxDuration")
+            and call.kwargs.get("Integer") == zap_scanner.CLIENT_SPIDER_MAX_DURATION_MINS
+            for call in api.call_args_list
+        ))
+        self.assertTrue(any(
+            call.args[:3] == ("clientSpider", "action", "setOptionMaxChildren")
+            and call.kwargs.get("Integer") == zap_scanner.CLIENT_SPIDER_MAX_CHILDREN
+            for call in api.call_args_list
+        ))
+
+    def test_ajax_deadline_stops_and_returns_warning_outcome(self):
+        calls = []
+
+        def api(component, kind, endpoint, **_params):
+            calls.append((component, kind, endpoint))
+            return {"status": "running"} if kind == "view" else {"Result": "OK"}
+
+        with patch.object(zap_scanner, "zap_api", side_effect=api):
+            outcome = zap_scanner.wait_for_ajax_spider(timeout=-1)
+        self.assertEqual(outcome["status"], "timed_out")
+        self.assertIn(("ajaxSpider", "action", "stop"), calls)
+
+    def test_client_timeout_does_not_skip_later_active_scans(self):
+        completed = {
+            "status": "completed", "scan_id": "1", "progress": 100,
+            "elapsed_seconds": 1.0, "error": "",
+        }
+        timed_out = {
+            "status": "timed_out", "scan_id": "2", "progress": 99,
+            "elapsed_seconds": 900.0, "error": "deadline",
+        }
+
+        def api(_component, kind, endpoint, **_params):
+            if kind == "action" and endpoint in {"scan", "scanAsUser"}:
+                return {"scan": "1"}
+            return {"Result": "OK"}
+
+        with (
+            patch.object(zap_scanner, "ensure_focused_scan_policies", return_value={}),
+            patch.object(zap_scanner, "configure_spider"),
+            patch.object(zap_scanner, "configure_active_scan", return_value=[]),
+            patch.object(zap_scanner, "create_context", return_value={"id": "3", "name": "ctx"}),
+            patch.object(zap_scanner, "zap_api", side_effect=api) as zap_api,
+            patch.object(zap_scanner, "wait_for_progress", side_effect=[completed, completed]),
+            patch.object(zap_scanner, "configure_ajax_spider"),
+            patch.object(zap_scanner, "wait_for_ajax_spider", return_value=completed),
+            patch.object(zap_scanner, "run_client_spider", return_value=timed_out),
+            patch.object(zap_scanner, "get_target_urls", return_value=["http://target/VulnerableApp/"]),
+            patch.object(zap_scanner, "seed_vulnerable_app_requests", return_value={
+                "attempted": 0, "seeded": 0, "failed": 0, "failed_urls": [], "error": "",
+            }),
+            patch.object(zap_scanner, "wait_for_passive_scan", return_value=completed),
+            patch.object(zap_scanner, "verify_discovery", return_value=["http://target/VulnerableApp/"]),
+            patch.object(zap_scanner, "configure_active_scan_exclusions", return_value=[]),
+            patch.object(zap_scanner, "run_focused_active_scans", return_value=[]),
+            patch.object(zap_scanner, "collect_alerts", return_value=([], [])),
+        ):
+            result = zap_scanner.run_scan(
+                "http://target/VulnerableApp", "vulnerable_app", return_details=True,
+            )
+
+        self.assertEqual(result["status"], "completed_with_warnings")
+        self.assertIn("client_spider", result["metadata"]["warnings"])
+        self.assertTrue(any(
+            call.args[:3] == ("ascan", "action", "scan") for call in zap_api.call_args_list
+        ))
+
+    def test_active_scan_configuration_applies_balanced_caps(self):
         with patch.object(zap_scanner, "zap_api", return_value={"scanners": []}) as api:
             zap_scanner.configure_active_scan()
 
         calls = [call.args[:3] + tuple(sorted(call.kwargs.items())) for call in api.call_args_list]
         self.assertIn(
-            ("ascan", "action", "setOptionMaxRuleDurationInMins", ("Integer", 0)),
+            ("ascan", "action", "setOptionMaxRuleDurationInMins", ("Integer", zap_scanner.ACTIVE_RULE_MAX_DURATION_MINS)),
             calls,
         )
         self.assertIn(
-            ("ascan", "action", "setOptionMaxScanDurationInMins", ("Integer", 0)),
+            ("ascan", "action", "setOptionMaxScanDurationInMins", ("Integer", zap_scanner.ACTIVE_SCAN_MAX_DURATION_MINS)),
             calls,
         )
         self.assertIn(
@@ -262,7 +421,7 @@ class ZapScannerConfigurationTests(unittest.TestCase):
             patch.object(zap_scanner, "AJAX_SPIDER_MAX_DURATION_MINS", -1),
             patch.object(zap_scanner, "zap_api") as invalid_duration_api,
         ):
-            with self.assertRaisesRegex(ValueError, "cannot be negative"):
+            with self.assertRaisesRegex(ValueError, "must be positive"):
                 zap_scanner.configure_ajax_spider()
         invalid_duration_api.assert_not_called()
 
@@ -389,7 +548,10 @@ class ZapScannerConfigurationTests(unittest.TestCase):
             patch.dict(zap_scanner.FOCUSED_SCAN_REQUESTS, {"vulnerable_app": [request]}),
             patch.object(zap_scanner, "ensure_focused_scan_policies"),
             patch.object(zap_scanner, "_seed_focused_request", return_value={"success": True}),
-            patch.object(zap_scanner, "wait_for_progress"),
+            patch.object(zap_scanner, "wait_for_progress", return_value={
+                "status": "completed", "scan_id": "21", "progress": 100,
+                "elapsed_seconds": 1.0, "error": "",
+            }),
             patch.object(zap_scanner, "zap_api", side_effect=focused_api) as api,
         ):
             results = zap_scanner.run_focused_active_scans(
@@ -400,7 +562,7 @@ class ZapScannerConfigurationTests(unittest.TestCase):
         self.assertEqual(scan_call.kwargs["recurse"], "false")
         self.assertEqual(scan_call.kwargs["method"], "GET")
         self.assertEqual(scan_call.kwargs["contextId"], "3")
-        self.assertEqual(results[0]["status"], "complete")
+        self.assertEqual(results[0]["status"], "completed")
 
     def test_dom_evidence_uses_zap_other_info_only_when_native_evidence_is_empty(self):
         evidence, source = zap_scanner._normalise_alert_evidence({

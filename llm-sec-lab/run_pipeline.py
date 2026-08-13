@@ -882,4 +882,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        outcome = main()
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    raise SystemExit(outcome.get("exit_code", 0) if isinstance(outcome, dict) else 0)

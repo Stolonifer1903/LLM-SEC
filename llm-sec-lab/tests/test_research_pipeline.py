@@ -23,6 +23,80 @@ class FakeChain:
 
 
 class AutomatedResearchPipelineTests(unittest.TestCase):
+    def test_authentication_pilot_resume_reuses_only_lock_matched_completed_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            attempt_dir = Path(tmp) / "attempt_1_unauthenticated"
+            attempt_dir.mkdir()
+            alert = self.alert(0)
+            alert.update({
+                "cluster_id": "saved-cluster",
+                "authentication_context": "unauthenticated",
+                "environment_lock_sha256": "lock-sha",
+            })
+            artifacts = {
+                "raw_zap_alerts.json": [],
+                "raw_alerts.json": [alert],
+                "scan_metadata.json": {"target": {
+                    "app": "juice_shop",
+                    "scan_profile": "final",
+                    "target_status": "completed",
+                    "authentication": {"enabled": False},
+                }},
+                "ground_truth_match_audit.json": {},
+            }
+            for name, value in artifacts.items():
+                (attempt_dir / name).write_text(json.dumps(value), encoding="utf-8")
+
+            loaded = pipeline._load_authentication_pilot_attempt(
+                attempt_dir, "off", {"environment_lock_sha256": "lock-sha"}, [], [],
+            )
+            self.assertEqual(len(loaded["alerts"]), 1)
+            with self.assertRaisesRegex(RuntimeError, "Environment lock mismatch"):
+                pipeline._load_authentication_pilot_attempt(
+                    attempt_dir, "off", {"environment_lock_sha256": "different"}, [], [],
+                )
+
+    def test_authentication_gate_passes_only_for_new_validated_positive(self):
+        alert = self.alert(0, name="SQL Injection", cwe="89", evidence="apple'", url="http://juice-shop:3000/rest/products/search")
+        alert.update({
+            "cluster_id": "auth", "plugin_id": "40018", "pluginid": "40018",
+            "request_method": "GET", "param": "q", "authentication_context": "authenticated",
+        })
+        rule = {
+            "rule_id": "source", "rule_status": "validated", "app": "juice_shop",
+            "zap_alert_name": "sql injection", "zap_cwe_id": "CWE-89",
+            "url_pattern": __import__("re").compile(r"^/rest/products/search$"),
+            "evidence_pattern": __import__("re").compile(r"apple'"),
+            "negative_evidence_pattern": None, "param_pattern": __import__("re").compile(r"^q$"),
+            "plugin_id": "40018", "request_method": "GET", "authentication_context": "any",
+            "target_version": "", "target_image_digest": "", "environment_lock_sha256": "",
+            "ground_truth_label": "VULNERABLE", "provider_key": "dbSchemaChallenge",
+            "rationale": "source backed", "validation_basis": "official_source",
+            "source_ref": "routes/search.ts",
+        }
+        passed = pipeline.authentication_pilot_decision([], [alert], [rule], [])
+        failed = pipeline.authentication_pilot_decision([alert], [alert], [rule], [])
+        self.assertEqual(passed["decision"], "authenticated")
+        self.assertTrue(passed["gate_passed"])
+        self.assertEqual(failed["decision"], "unauthenticated")
+        self.assertFalse(failed["gate_passed"])
+
+    def test_final_scan_eligibility_requires_completed_active_and_discovery(self):
+        complete_attempt = {
+            "attempt": 1,
+            "stages": {
+                "broad_active_scan": {"status": "completed", "progress": 100},
+                "discovery_validation": {"status": "completed"},
+            },
+        }
+        status = {"targets": {
+            app: {"status": "completed", "selected_attempt": 1, "attempts": [complete_attempt]}
+            for app in pipeline.TARGETS
+        }}
+        self.assertTrue(pipeline.final_scan_eligibility(status)["triage_eligible"])
+        status["targets"]["juice_shop"]["attempts"][0]["stages"]["broad_active_scan"] = {"status": "stalled"}
+        self.assertFalse(pipeline.final_scan_eligibility(status)["triage_eligible"])
+
     def alert(self, alert_id, *, name="Timestamp Disclosure - Unix", cwe="497", evidence="1700000000", url="http://juice-shop:3000/app.js"):
         return pipeline.canonical_alert({
             "app": "juice_shop", "alert_name": name, "cweid": cwe,
@@ -49,6 +123,19 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
             "negative_evidence_pattern": negative, "ground_truth_label": label,
             "provider_key": provider, "rationale": "fixture rule",
         }
+
+    @staticmethod
+    def scan_result(alerts, status="completed", warnings=None):
+        return {
+            "alerts": alerts,
+            "raw_zap_alerts": [],
+            "metadata": {"warnings": list(warnings or []), "target_status": status},
+            "status": status,
+        }
+
+    @staticmethod
+    def write_mock_report(_alerts, path, scan_profile="benchmark"):
+        Path(path).write_text(json.dumps({"scan_profile": scan_profile}), encoding="utf-8")
 
     def test_dedup_key_is_prompt_complete_and_reexpands_source_order(self):
         alerts = [self.alert(0), self.alert(1), self.alert(2, evidence="1700000001")]
@@ -151,6 +238,75 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
         self.assertIn("eta=0s", progress)
         self.assertIn("requests=3", progress)
 
+    def test_remote_disconnect_is_retried(self):
+        chain = FakeChain()
+        disconnect = pipeline.RequestsConnectionError(
+            "Connection aborted",
+            pipeline.RemoteDisconnected("Remote end closed connection without response"),
+        )
+        with (
+            patch.object(
+                chain,
+                "invoke",
+                side_effect=[disconnect, self.assessment()],
+                create=True,
+            ) as invoke,
+            patch.object(pipeline.time, "sleep") as sleep,
+        ):
+            result = pipeline._invoke(chain, {"alert": "fixture"})
+
+        self.assertEqual(result, self.assessment())
+        self.assertEqual(invoke.call_count, 2)
+        sleep.assert_called_once_with(pipeline.NVIDIA_RETRY_BASE_SECONDS)
+
+    def test_failed_triage_resumes_checkpoint_and_repairs_partial_tail(self):
+        alert = self.alert(0)
+        run_id = "run_checkpoint_fixture"
+        chain = FakeChain()
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / run_id
+            with (
+                patch.object(pipeline, "_model", return_value=object()),
+                patch.object(pipeline, "_prompt", return_value=FakePrompt(chain)),
+                patch.object(pipeline, "_repair_chain", return_value=chain),
+                patch.object(
+                    pipeline,
+                    "_invoke",
+                    side_effect=[self.assessment(), RuntimeError("forced stop")],
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "forced stop"):
+                    pipeline.run_automated([alert], run_dir, "benchmark")
+
+            checkpoint = run_dir / pipeline.TRIAGE_CHECKPOINT_FILE
+            state = json.loads(
+                (run_dir / pipeline.TRIAGE_CHECKPOINT_STATE_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["completed_assessment_count"], 1)
+            self.assertEqual(len(checkpoint.read_text(encoding="utf-8").splitlines()), 1)
+            with checkpoint.open("a", encoding="utf-8") as file:
+                file.write('{"partial"')
+
+            with (
+                patch.object(pipeline, "_model", return_value=object()),
+                patch.object(pipeline, "_prompt", return_value=FakePrompt(chain)),
+                patch.object(pipeline, "_repair_chain", return_value=chain),
+                patch.object(pipeline, "_invoke", return_value=self.assessment()) as invoke,
+            ):
+                result = pipeline.resume_and_run(run_dir)
+
+            self.assertTrue(result["resumed"])
+            self.assertEqual(invoke.call_count, 2)
+            self.assertTrue((run_dir / "pipeline_results.json").is_file())
+            self.assertFalse(checkpoint.exists())
+            self.assertFalse((run_dir / pipeline.TRIAGE_CHECKPOINT_STATE_FILE).exists())
+            records = json.loads((run_dir / "pipeline_results.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(records), len(pipeline.STRATEGIES))
+            diagnostics = json.loads(
+                (run_dir / "parse_diagnostics.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(diagnostics["metadata"]["resumed_assessment_count"], 1)
+
     def test_scan_only_writes_scan_artifacts_without_triage(self):
         alerts = [{"app": "juice_shop", "alert_name": "Example", "url": "http://juice-shop:3000/"}]
         with tempfile.TemporaryDirectory() as directory:
@@ -159,8 +315,11 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                 patch.object(pipeline, "wait_for_zap"),
                 patch.object(pipeline, "start_fresh_zap_session"),
                 patch.object(pipeline, "reset_scan_metadata"),
-                patch.object(pipeline, "run_scan", side_effect=[alerts, []]) as scan,
-                patch.object(pipeline, "save_scan_report") as save_report,
+                patch.object(
+                    pipeline, "run_scan",
+                    side_effect=[self.scan_result(alerts), self.scan_result([])],
+                ) as scan,
+                patch.object(pipeline, "save_scan_report", side_effect=self.write_mock_report) as save_report,
                 patch.object(pipeline, "run_automated") as triage,
             ):
                 result = pipeline.scan_and_run(run_dir, "baseline", scan_only=True)
@@ -181,11 +340,144 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                 patch.object(pipeline, "wait_for_zap"),
                 patch.object(pipeline, "start_fresh_zap_session"),
                 patch.object(pipeline, "reset_scan_metadata"),
-                patch.object(pipeline, "run_scan", side_effect=[alerts, []]) as scan,
-                patch.object(pipeline, "save_scan_report"),
+                patch.object(
+                    pipeline, "run_scan",
+                    side_effect=[self.scan_result(alerts), self.scan_result([])],
+                ) as scan,
+                patch.object(pipeline, "save_scan_report", side_effect=self.write_mock_report),
             ):
                 pipeline.scan_and_run(Path(directory) / "ordered", "benchmark", scan_only=True)
         self.assertEqual([call.args[1] for call in scan.call_args_list], ["vulnerable_app", "juice_shop"])
+
+    def test_controlled_timeout_finishes_with_warning_and_reusable_aggregate(self):
+        alerts = [{"app": "vulnerable_app", "alert_name": "Example", "url": "http://target/"}]
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "warnings"
+            with (
+                patch.object(pipeline, "wait_for_zap"),
+                patch.object(pipeline, "start_fresh_zap_session"),
+                patch.object(pipeline, "reset_scan_metadata"),
+                patch.object(pipeline, "run_scan", side_effect=[
+                    self.scan_result(alerts, "completed_with_warnings", ["client_spider"]),
+                    self.scan_result([]),
+                ]),
+                patch.object(pipeline, "save_scan_report", side_effect=self.write_mock_report),
+            ):
+                result = pipeline.scan_and_run(run_dir, "benchmark", scan_only=True)
+            status = json.loads((run_dir / "scan_status.json").read_text(encoding="utf-8"))
+            aggregate_exists = (run_dir / "raw_alerts.json").exists()
+
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["scan_status"], "completed_with_warnings")
+        self.assertEqual(status["status"], "completed_with_warnings")
+        self.assertTrue(aggregate_exists)
+
+    def test_hard_failure_retries_once_then_uses_successful_attempt(self):
+        vulnerable_alert = {
+            "app": "vulnerable_app", "alert_name": "Example", "url": "http://target/vuln",
+        }
+        juice_alert = {
+            "app": "juice_shop", "alert_name": "Example", "url": "http://target/juice",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "retry"
+            with (
+                patch.object(pipeline, "wait_for_zap"),
+                patch.object(pipeline, "start_fresh_zap_session") as fresh,
+                patch.object(pipeline, "reset_scan_metadata"),
+                patch.object(pipeline, "collect_alerts", return_value=([], [])),
+                patch.object(
+                    pipeline, "run_scan",
+                    side_effect=[
+                        RuntimeError("connection lost"),
+                        self.scan_result([vulnerable_alert]),
+                        self.scan_result([juice_alert]),
+                    ],
+                ) as scan,
+                patch.object(pipeline, "save_scan_report", side_effect=self.write_mock_report),
+            ):
+                result = pipeline.scan_and_run(run_dir, "benchmark", scan_only=True)
+            status = json.loads((run_dir / "scan_status.json").read_text(encoding="utf-8"))
+            aggregate = json.loads((run_dir / "raw_alerts.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(fresh.call_count, 3)
+        self.assertEqual([call.args[1] for call in scan.call_args_list], [
+            "vulnerable_app", "vulnerable_app", "juice_shop",
+        ])
+        self.assertEqual(status["targets"]["vulnerable_app"]["selected_attempt"], 2)
+        self.assertEqual(len(status["targets"]["vulnerable_app"]["attempts"]), 2)
+        self.assertEqual(len(aggregate), 2)
+
+    def test_retry_exhaustion_continues_other_target_and_blocks_aggregate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "partial"
+            with (
+                patch.object(pipeline, "wait_for_zap"),
+                patch.object(pipeline, "start_fresh_zap_session") as fresh,
+                patch.object(pipeline, "reset_scan_metadata"),
+                patch.object(pipeline, "collect_alerts", return_value=([], [])),
+                patch.object(pipeline, "run_scan", side_effect=RuntimeError("ZAP unavailable")) as scan,
+                patch.object(pipeline, "save_scan_report") as report,
+                patch.object(pipeline, "run_automated") as triage,
+            ):
+                result = pipeline.scan_and_run(run_dir, "benchmark", scan_only=True)
+            status = json.loads((run_dir / "scan_status.json").read_text(encoding="utf-8"))
+            partial_exists = (run_dir / "partial_raw_alerts.json").exists()
+            aggregate_exists = (run_dir / "raw_alerts.json").exists()
+
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["failed_targets"], ["vulnerable_app", "juice_shop"])
+        self.assertEqual(scan.call_count, 4)
+        self.assertEqual(fresh.call_count, 4)
+        self.assertEqual(status["status"], "partial_failed")
+        self.assertTrue(partial_exists)
+        self.assertFalse(aggregate_exists)
+        report.assert_not_called()
+        triage.assert_not_called()
+
+    def test_keyboard_interrupt_checkpoints_current_target(self):
+        recovered = [{
+            "app": "vulnerable_app", "alert_name": "Recovered", "url": "http://target/",
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "interrupted"
+            with (
+                patch.object(pipeline, "TARGET_RETRIES", 0),
+                patch.object(pipeline, "wait_for_zap"),
+                patch.object(pipeline, "start_fresh_zap_session"),
+                patch.object(pipeline, "reset_scan_metadata"),
+                patch.object(pipeline, "run_scan", side_effect=KeyboardInterrupt),
+                patch.object(pipeline, "collect_alerts", return_value=([{"alert": "Recovered"}], recovered)),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    pipeline.scan_and_run(run_dir, "benchmark", scan_only=True)
+            status = json.loads((run_dir / "scan_status.json").read_text(encoding="utf-8"))
+            partial_exists = (run_dir / "partial_raw_alerts.json").exists()
+            checkpoint_exists = (
+                run_dir / "targets" / "vulnerable_app" / "attempt_1" / "raw_alerts.json"
+            ).exists()
+
+        self.assertEqual(status["status"], "interrupted")
+        self.assertTrue(partial_exists)
+        self.assertTrue(checkpoint_exists)
+
+    def test_reuse_excludes_salvaged_and_partial_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            complete = root / "run_20260101T000000Z"
+            partial = root / "run_20260102T000000Z"
+            salvaged = root / "run_20260103T000000Z_salvaged"
+            for path in (complete, partial, salvaged):
+                path.mkdir()
+                (path / "raw_alerts.json").write_text("[]", encoding="utf-8")
+            (complete / "scan_status.json").write_text('{"status":"completed_with_warnings"}', encoding="utf-8")
+            (partial / "scan_status.json").write_text('{"status":"partial_failed"}', encoding="utf-8")
+            (salvaged / "salvage_manifest.json").write_text("{}", encoding="utf-8")
+
+            self.assertEqual(pipeline.latest_raw_alerts_path(root), complete / "raw_alerts.json")
+            with self.assertRaisesRegex(ValueError, "not a complete two-app run"):
+                pipeline.resolve_reuse_source(root, str(partial))
 
     def test_benchmark_run_writes_request_response_without_triage(self):
         alerts = [{
