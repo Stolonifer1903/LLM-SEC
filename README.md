@@ -86,16 +86,25 @@ Change that value if your NVIDIA endpoint uses a different model name.
 
 ## Start The Lab Services
 
-From `llm-sec-lab/`:
+The Compose file deliberately refuses floating image tags. From `llm-sec-lab/`,
+start Docker Desktop and capture the environment before the first final run:
 
 ```bash
-docker compose up -d
+python -B run_pipeline.py --capture-environment-lock
 ```
+
+This inspects existing containers and local images before pulling anything, resolves
+only missing images, writes ignored `pinned-images.env`, starts the services by
+immutable digest, and records `environment-lock.json`. It also stores the pinned
+Juice Shop challenge catalogue and a non-destructive catalogue sync report. Subsequent
+invocations reuse the captured lock and recreate `pinned-images.env`; they do not
+silently advance versions. Compose commands must use
+`docker compose --env-file pinned-images.env ...`.
 
 Check that the containers are running:
 
 ```bash
-docker compose ps
+docker compose --env-file pinned-images.env ps
 ```
 
 Local service URLs:
@@ -120,11 +129,76 @@ To assess only ZAP against the webapps before adding or updating ground truth, r
 python run_pipeline.py --scan-only --scan-profile targeted
 ```
 
+### Final reproducible scan workflow
+
+Configure a dedicated local Juice Shop test account in `.env`; neither value is
+written to scan artifacts:
+
+```text
+JUICE_SHOP_AUTH_EMAIL=llm-sec-zap@example.test
+JUICE_SHOP_AUTH_PASSWORD=use-a-local-random-password
+```
+
+Then use at most the planned three attempts:
+
+```bash
+# Attempts 1 and 2: matched focused unauthenticated/authenticated Juice Shop pilots
+python -B run_pipeline.py --juice-auth-pilot --scan-profile final
+
+# Attempt 3: final two-application scan; auto consumes the pilot decision
+python -B run_pipeline.py --scan-only --scan-profile final --juice-auth auto
+
+# Begin LLM triage only after triage_eligibility.json says true
+python -B run_pipeline.py --reuse-from results/runs/<final_scan_run_id> --scan-profile final
+```
+
+The final profile uses one attempt per target with no automatic retry. Its broad and
+focused active scans have no elapsed or per-rule deadline; a 45-minute watchdog stops
+only a scan whose overall percentage and per-plugin `scanProgress` snapshot both stop
+changing. A watchdog stop is incomplete and cannot be reused for triage. Crawler and
+passive-drain bounds remain in force. Juice Shop uses traditional plus AJAX discovery
+and skips Client Spider.
+
+The authenticated pilot is selected only if it adds an authenticated-only alert that
+matches a validated positive rule exactly. New routes, passive noise, candidate rules,
+and unsupported challenge families do not pass the gate. Pilot alerts are stored for
+audit but never enter final metrics.
+
 This writes the raw alerts and `zap_scan_report.json` under `results/runs/<run_id>/` and makes no NIM/LLM calls. Console output reports ZAP readiness, each target, per-target alert counts, and the artifact directory.
 
-Browser-driven discovery defaults to two concurrent AJAX Spider browsers. Set `ZAP_AJAX_BROWSERS` to a positive integer to tune that concurrency for the local machine. `ZAP_AJAX_MAX_DURATION_MINS` defaults to `0`, which leaves the AJAX crawl uncapped; set a positive duration only when a bounded crawl is required. The Docker stack intentionally remains on ZAP's stable image for reproducible research runs.
+To triage a completed scan without contacting ZAP again, pass its run directory:
 
-Each run writes an immutable directory under `results/runs/<run_id>/`. The scan and inference stages never read ground truth. The targeted profile retains the scanner's authenticated seeds and focused active rules.
+```bash
+python run_pipeline.py --reuse-from results/runs/<scan_run_id> --scan-profile benchmark
+```
+
+During LLM triage, each completed `(prompt_strategy, cluster_id)` assessment is appended to one `triage_checkpoint.jsonl` file and progress metadata is atomically updated in `triage_checkpoint_state.json`. A transient API disconnect is retried with bounded exponential backoff. If the process still exits before triage finishes, resume the same result directory in place:
+
+```bash
+python run_pipeline.py --resume-from results/runs/<incomplete_triage_run_id>
+```
+
+Resume validates the saved run, model, strategies, and cluster set, ignores a partially written final checkpoint line, and requests only missing assessments. After `pipeline_results.json` and `parse_diagnostics.json` are safely written, the two temporary checkpoint files are removed. Runs created before checkpoint support cannot recover earlier completed LLM calls and must restart from their saved raw alerts.
+
+Historical profiles keep their bounded behavior. Their balanced defaults are:
+
+- Traditional spider: 10 minutes, depth 5, 100 children.
+- AJAX Spider: 10 minutes, depth 5, one browser.
+- Client Spider: 15 minutes, depth 5, 100 children, one browser.
+- Passive-scan drain: 10 minutes.
+- Broad active scan: 120 minutes total and 10 minutes per rule.
+- Focused scans: 5 minutes per request and 30 minutes total per target.
+- Hard target failures: one retry in a fresh ZAP session.
+
+Override these with `ZAP_SPIDER_MAX_DURATION_MINS`, `ZAP_SPIDER_MAX_DEPTH`, `ZAP_SPIDER_MAX_CHILDREN`, `ZAP_AJAX_MAX_DURATION_MINS`, `ZAP_AJAX_MAX_CRAWL_DEPTH`, `ZAP_AJAX_BROWSERS`, `ZAP_CLIENT_MAX_DURATION_MINS`, `ZAP_CLIENT_MAX_CRAWL_DEPTH`, `ZAP_CLIENT_MAX_CHILDREN`, `ZAP_CLIENT_BROWSERS`, `ZAP_PASSIVE_SCAN_TIMEOUT_SECONDS`, `ZAP_ACTIVE_MAX_SCAN_DURATION_MINS`, `ZAP_ACTIVE_MAX_RULE_DURATION_MINS`, `ZAP_FOCUSED_SCAN_TIMEOUT_MINS`, `ZAP_FOCUSED_SCAN_GROUP_TIMEOUT_MINS`, and `ZAP_TARGET_RETRIES`. All duration/depth/child/browser limits must be positive; retries may be zero.
+
+For the final profile, `ZAP_ACTIVE_STALL_MINS` controls the activity watchdog and
+defaults to 45. Fixed active-scan duration variables are intentionally ignored and
+the effective limits are recorded as zero.
+
+Each application runs in a new ZAP session. A controlled stage timeout is stopped, recorded as a warning, and the target proceeds to later seeding and active/focused stages. A hard API failure is checkpointed and retried once. If the retry fails, the other application is still attempted and the command exits nonzero after preserving partial evidence.
+
+Each run creates its immutable directory under `results/runs/<run_id>/` before scanning. `scan_status.json` records run, target, attempt, and stage outcomes. Every attempt is checkpointed under `targets/<app>/attempt_<n>/`. Completed two-app scans write aggregate `raw_alerts.json`; failed or interrupted scans write `partial_raw_alerts.json` instead and cannot be selected automatically by `--reuse-from`. The scan and inference stages never read ground truth. The targeted profile retains the scanner's seeded requests and focused active rules.
 
 The pipeline deduplicates exact prompt-equivalent alerts, triages every unique cluster, and re-expands predictions to raw alerts. It runs `zero_shot`, `few_shot`, and `cot` without explicit confidence elicitation. The bundled few-shot examples are generic, source-cited, and do not identify either study application.
 
@@ -143,7 +217,7 @@ CVSS exploitability estimates are currently descriptive only. CVSS-MAE and anony
 From `llm-sec-lab/`:
 
 ```bash
-docker compose down
+docker compose --env-file pinned-images.env down
 ```
 
 If you want to remove downloaded container data and images, use Docker Desktop or Docker CLI cleanup commands deliberately.
@@ -154,12 +228,14 @@ If you want to remove downloaded container data and images, use Docker Desktop o
 - Docker cannot pull images: confirm Docker is running and the machine has internet access.
 - ZAP does not respond: run `docker compose ps` and inspect logs with `docker compose logs zap`.
 - VulnerableApp/Juice Shop unavailable from the browser: check the local port mappings in `compose.yaml`.
-- Thorough scans can take a substantial amount of time: active scan rule duration, total duration, per-rule alert counts, and AJAX Spider duration are uncapped by default. Set `ZAP_AJAX_MAX_DURATION_MINS` to a positive value when a bounded browser crawl is required, and tune `ZAP_AJAX_BROWSERS` if two concurrent browsers are too heavy for the local machine.
+- A completed run with `completed_with_warnings` reached one or more stage limits but still finalized both targets. Inspect `scan_status.json` and `zap_scan_report.json` before interpreting coverage.
+- A `partial_failed` or `interrupted` run is audit/recovery evidence only. It has no aggregate `raw_alerts.json` and is deliberately excluded from automatic reuse.
+- If browser crawling is still heavy, reduce the Client/AJAX depth or child limits rather than increasing browser concurrency first.
 
 ## Typical Workflow
 
-1. Start Docker services with `docker compose up -d`.
-2. Run `python run_pipeline.py --scan --scan-profile targeted`.
+1. Capture/start the pinned services with `python -B run_pipeline.py --capture-environment-lock`.
+2. Run `python run_pipeline.py --scan --scan-profile targeted` for historical-profile work, or use the final workflow above.
 3. Inspect the immutable artefacts under `results/runs/<run_id>/`.
 4. Add only version-controlled validated rules when new defensible alert-to-challenge evidence is available; do not edit runtime outputs to assign labels.
-5. Shut down services with `docker compose down`.
+5. Shut down services with `docker compose --env-file pinned-images.env down`.
