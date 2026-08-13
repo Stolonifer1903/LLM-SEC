@@ -7,6 +7,7 @@
 .discovery/bookshelf/*/extracted_content/
 .discovery/bookshelf/providers/
 .env
+pinned-images.env
 .venv/
 llm-sec-lab/.venv/
 llm-sec-env/

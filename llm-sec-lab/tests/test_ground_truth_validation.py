@@ -4,9 +4,33 @@ import unittest
 from pathlib import Path
 
 from evaluator import load_detection_validation, load_ground_truth
+from research_pipeline import load_automated_rules
 
 
 class GroundTruthValidationOverlayTests(unittest.TestCase):
+    def test_repository_juice_positive_is_fail_closed_until_version_capture(self):
+        validated, provisional = load_automated_rules()
+
+        labels_by_app = {
+            app: {rule["ground_truth_label"] for rule in validated if rule["app"] == app}
+            for app in ("vulnerable_app", "juice_shop")
+        }
+        positive_rules = [
+            rule for rule in validated if rule["ground_truth_label"] == "VULNERABLE"
+        ]
+
+        self.assertEqual(labels_by_app["vulnerable_app"], {"VULNERABLE", "NOT_VULNERABLE"})
+        self.assertTrue(all(rule["provider_key"] for rule in positive_rules))
+        if "VULNERABLE" in labels_by_app["juice_shop"]:
+            self.assertEqual(labels_by_app["juice_shop"], {"VULNERABLE", "NOT_VULNERABLE"})
+            self.assertEqual(len(positive_rules), 7)
+            self.assertEqual(provisional, [])
+        else:
+            self.assertEqual(labels_by_app["juice_shop"], {"NOT_VULNERABLE"})
+            self.assertEqual(len(positive_rules), 6)
+            self.assertEqual(len(provisional), 1)
+            self.assertEqual(provisional[0]["rule_status"], "candidate_version_unbound")
+
     def test_overlay_defaults_cover_unlisted_catalogue_challenges(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

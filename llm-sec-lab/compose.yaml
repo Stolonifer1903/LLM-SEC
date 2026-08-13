@@ -5,7 +5,7 @@ networks:
 services:
 
   juice-shop:
-    image: bkimminich/juice-shop
+    image: ${JUICE_SHOP_IMAGE:?Run python -B run_pipeline.py --capture-environment-lock first}
     container_name: juice-shop
     restart: unless-stopped
     environment:
@@ -16,7 +16,7 @@ services:
       - lab-net
 
   vulnerable-app:
-    image: sasanlabs/owasp-vulnerableapp:latest
+    image: ${VULNERABLE_APP_IMAGE:?Run python -B run_pipeline.py --capture-environment-lock first}
     container_name: vulnerable-app
     ports:
       - "9090:9090"
@@ -24,8 +24,10 @@ services:
       - lab-net
 
   zap:
-    image: ghcr.io/zaproxy/zaproxy:stable
+    image: ${ZAP_IMAGE:?Run python -B run_pipeline.py --capture-environment-lock first}
     container_name: zap
+    environment:
+      ZAP_PORT: "8090"
     ports:
       - "8090:8090"
     networks:

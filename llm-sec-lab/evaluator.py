@@ -33,6 +33,11 @@ RULE_COLUMNS = (
     "challenge_ids",
     "rationale",
 )
+RULE_PROVENANCE_COLUMNS = (
+    "plugin_id", "request_method", "param_regex", "authentication_context",
+    "target_version", "target_image_digest", "environment_lock_sha256",
+    "validation_basis", "source_ref",
+)
 VALID_GROUND_TRUTH_LABELS = {"VULNERABLE", "NOT_VULNERABLE"}
 PARSE_SUCCESS_THRESHOLD = 0.98
 RUN_METADATA_FIELDS = (
@@ -51,6 +56,7 @@ VALIDATION_COLUMNS = (
     "validated_detection_mode", "zap_alert_name", "zap_cwe_id", "url_regex",
     "evidence_regex", "scan_profile", "validation_run_id", "rationale",
 )
+VALIDATION_PROVENANCE_COLUMNS = RULE_PROVENANCE_COLUMNS
 VALIDATION_STATUSES = {
     "validated", "candidate", "supporting_only", "manual_required", "out_of_scope",
 }
@@ -158,6 +164,9 @@ def load_detection_validation(path, gt: pd.DataFrame) -> pd.DataFrame:
     missing = set(VALIDATION_COLUMNS).difference(validation.columns)
     if missing:
         raise ValueError(f"Detection validation overlay is missing columns: {sorted(missing)}")
+    for column in VALIDATION_PROVENANCE_COLUMNS:
+        if column not in validation.columns:
+            validation[column] = ""
     validation["provider_key"] = validation["provider_key"].str.strip()
     if (validation["provider_key"] == "").any() or validation["provider_key"].duplicated().any():
         raise ValueError("Validation overlay provider_key values must be present and unique")
@@ -206,6 +215,7 @@ def load_detection_validation(path, gt: pd.DataFrame) -> pd.DataFrame:
             "scan_profile": "",
             "validation_run_id": "",
             "rationale": "No explicit validation record exists yet.",
+            **{column: "" for column in VALIDATION_PROVENANCE_COLUMNS},
         })
     if defaults:
         validation = pd.concat([validation, pd.DataFrame(defaults)], ignore_index=True)
@@ -217,6 +227,9 @@ def load_match_rules(path="ground_truth_match_rules.csv", gt: pd.DataFrame = Non
     missing = set(RULE_COLUMNS).difference(rules_df.columns)
     if missing:
         raise ValueError(f"Ground-truth rules are missing columns: {sorted(missing)}")
+    for column in RULE_PROVENANCE_COLUMNS:
+        if column not in rules_df.columns:
+            rules_df[column] = ""
     rules_df["rule_id"] = rules_df["rule_id"].str.strip()
     if (rules_df["rule_id"] == "").any():
         raise ValueError("Every ground-truth rule must have a non-empty rule_id")
@@ -254,6 +267,11 @@ def load_match_rules(path="ground_truth_match_rules.csv", gt: pd.DataFrame = Non
                 & (validation["url_regex"].str.strip() == row["url_regex"].strip())
                 & (validation["evidence_regex"].str.strip() == row["evidence_regex"].strip())
             ]
+            for field in RULE_PROVENANCE_COLUMNS:
+                if row[field].strip():
+                    validation_rows = validation_rows[
+                        validation_rows[field].str.strip() == row[field].strip()
+                    ]
             if len(validation_rows) != 1:
                 raise ValueError(
                     f"Vulnerable rule {row['rule_id']} must exactly match one validated overlay row"
@@ -265,6 +283,10 @@ def load_match_rules(path="ground_truth_match_rules.csv", gt: pd.DataFrame = Non
                 re.compile(row["evidence_regex"], re.IGNORECASE | re.DOTALL)
                 if row["evidence_regex"] else None
             )
+            param_pattern = (
+                re.compile(row["param_regex"], re.IGNORECASE)
+                if row["param_regex"] else None
+            )
         except re.error as exc:
             raise ValueError(f"Rule {row['rule_id']} contains an invalid regex: {exc}") from exc
 
@@ -275,6 +297,15 @@ def load_match_rules(path="ground_truth_match_rules.csv", gt: pd.DataFrame = Non
             "zap_cwe_id": normalize_cwe_id(row["zap_cwe_id"]),
             "url_pattern": url_pattern,
             "evidence_pattern": evidence_pattern,
+            "param_pattern": param_pattern,
+            "plugin_id": row["plugin_id"].strip(),
+            "request_method": row["request_method"].strip().upper(),
+            "authentication_context": row["authentication_context"].strip().lower(),
+            "target_version": row["target_version"].strip(),
+            "target_image_digest": row["target_image_digest"].strip(),
+            "environment_lock_sha256": row["environment_lock_sha256"].strip(),
+            "validation_basis": row["validation_basis"].strip().lower(),
+            "source_ref": row["source_ref"].strip(),
             "ground_truth_label": label,
             "challenge_ids": challenge_ids,
             "rationale": row["rationale"].strip(),
@@ -292,10 +323,27 @@ def _rule_matches_alert(rule: dict, alert: dict) -> bool:
 
     url_path = normalize_url_path(alert.get("url", ""))
     evidence = str(alert.get("evidence", ""))
+    param = str(alert.get("param", ""))
     if rule["url_pattern"] and not rule["url_pattern"].search(url_path):
         return False
     if rule["evidence_pattern"] and not rule["evidence_pattern"].search(evidence):
         return False
+    if rule.get("plugin_id") and rule["plugin_id"] != str(
+        alert.get("plugin_id", alert.get("pluginid", ""))
+    ).strip():
+        return False
+    if rule.get("request_method") and rule["request_method"] != str(
+        alert.get("request_method", "")
+    ).strip().upper():
+        return False
+    if rule.get("param_pattern") and not rule["param_pattern"].search(param):
+        return False
+    authentication = str(alert.get("authentication_context", "")).strip().lower()
+    if (rule.get("authentication_context") or "") not in {"", "any", authentication}:
+        return False
+    for field in ("target_version", "target_image_digest", "environment_lock_sha256"):
+        if rule.get(field) and rule[field] != str(alert.get(field, "")).strip():
+            return False
     return True
 
 
@@ -314,6 +362,8 @@ def match_alert_to_ground_truth(alert: dict, rules: list[dict]) -> dict:
             "matched_rule_id": "",
             "challenge_ids": [],
             "rationale": "No defensible ground-truth rule matched this alert.",
+            "validation_basis": "",
+            "source_ref": "",
         }
 
     rule = matches[0]
@@ -323,6 +373,8 @@ def match_alert_to_ground_truth(alert: dict, rules: list[dict]) -> dict:
         "matched_rule_id": rule["rule_id"],
         "challenge_ids": rule["challenge_ids"],
         "rationale": rule["rationale"],
+        "validation_basis": rule.get("validation_basis", ""),
+        "source_ref": rule.get("source_ref", ""),
     }
 
 
@@ -477,6 +529,15 @@ def build_match_audit(base_records: list[dict], rules: list[dict]) -> pd.DataFra
             "matched_rule_id": match["matched_rule_id"],
             "challenge_ids": "|".join(match["challenge_ids"]),
             "rationale": match["rationale"],
+            "validation_basis": match.get("validation_basis", ""),
+            "source_ref": match.get("source_ref", ""),
+            "plugin_id": record.get("plugin_id", record.get("pluginid", "")),
+            "request_method": record.get("request_method", ""),
+            "param": record.get("param", ""),
+            "authentication_context": record.get("authentication_context", ""),
+            "target_version": record.get("target_version", ""),
+            "target_image_digest": record.get("target_image_digest", ""),
+            "environment_lock_sha256": record.get("environment_lock_sha256", ""),
             "family_frequency": family_counts[family_key],
         })
     return pd.DataFrame(audit_rows)

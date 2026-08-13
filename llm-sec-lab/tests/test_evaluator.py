@@ -42,6 +42,33 @@ FIXTURE_ALERTS = [
 
 
 class GroundTruthRuleTests(unittest.TestCase):
+    def test_exact_provenance_constraints_fail_closed(self):
+        rule = {
+            "app": "juice_shop", "zap_alert_name": "sql injection", "zap_cwe_id": "CWE-89",
+            "url_pattern": __import__("re").compile(r"^/rest/products/search$"),
+            "evidence_pattern": __import__("re").compile(r"apple'"),
+            "param_pattern": __import__("re").compile(r"^q$"), "plugin_id": "40018",
+            "request_method": "GET", "authentication_context": "any", "target_version": "17.1.0",
+            "target_image_digest": "sha256:abc", "environment_lock_sha256": "lock",
+            "ground_truth_label": "VULNERABLE", "challenge_ids": ["dbSchemaChallenge"],
+            "rationale": "source", "validation_basis": "official_source", "source_ref": "routes/search.ts",
+            "rule_id": "exact",
+        }
+        alert = {
+            "alert_id": "1", "app": "juice_shop", "alert_name": "SQL Injection",
+            "zap_cwe_id": "CWE-89", "url": "http://juice-shop:3000/rest/products/search",
+            "evidence": "apple'", "param": "q", "plugin_id": "40018",
+            "request_method": "GET", "authentication_context": "authenticated",
+            "target_version": "17.1.0", "target_image_digest": "sha256:abc",
+            "environment_lock_sha256": "lock",
+        }
+        self.assertEqual(match_alert_to_ground_truth(alert, [rule])["ground_truth_label"], "VULNERABLE")
+        for field, value in (("request_method", "POST"), ("param", "id"), ("plugin_id", "40019"), ("target_version", "18.0.0")):
+            self.assertEqual(
+                match_alert_to_ground_truth({**alert, field: value}, [rule])["ground_truth_label"],
+                "UNMAPPED",
+            )
+
     @classmethod
     def setUpClass(cls):
         cls.gt = load_ground_truth(LAB_DIR / "ground_truth.csv")
