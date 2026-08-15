@@ -178,6 +178,11 @@ During LLM triage, each completed `(prompt_strategy, cluster_id)` assessment is 
 python run_pipeline.py --resume-from results/runs/<incomplete_triage_run_id>
 ```
 
+Checkpoint state includes a triage-protocol fingerprint covering the prompts, response
+schema, repair instruction, strategy list, and few-shot examples. A checkpoint created
+under an older or different protocol is rejected; start a new triage run from its saved
+complete `raw_alerts.json` with `--reuse-from` instead of mixing assessment protocols.
+
 Resume validates the saved run, model, strategies, and cluster set, ignores a partially written final checkpoint line, and requests only missing assessments. After `pipeline_results.json` and `parse_diagnostics.json` are safely written, the two temporary checkpoint files are removed. Runs created before checkpoint support cannot recover earlier completed LLM calls and must restart from their saved raw alerts.
 
 Historical profiles keep their bounded behavior. Their balanced defaults are:
@@ -202,11 +207,25 @@ Each run creates its immutable directory under `results/runs/<run_id>/` before s
 
 The pipeline deduplicates exact prompt-equivalent alerts, triages every unique cluster, and re-expands predictions to raw alerts. It runs `zero_shot`, `few_shot`, and `cot` without explicit confidence elicitation. The bundled few-shot examples are generic, source-cited, and do not identify either study application.
 
+If an initial response fails strict JSON parsing, the single automated repair attempt
+replays the same alert and prompt strategy, includes the malformed response and parse
+error, and asks the model to preserve every recoverable assessment value. Repair never
+receives ground truth. Each result records `initial_parsed_successfully`,
+`repair_attempted`, `repaired`, and `assessment_origin`; an unsuccessful repair remains
+unparsed and is excluded from metrics rather than being treated as safe.
+
 Only after `pipeline_results.json` is written does the evaluator use `ground_truth_match_rules.csv`. A rule requires exact app, controlled alert-family name, ZAP-provided CWE, route constraint, and evidence constraint. It never uses the model prediction, rationale, predicted CWE, severity, or confidence to assign a label.
 
 Alerts with no validated rule remain in `unmapped_alerts.json` and the match audit, but are not assumed safe. Candidate and supporting-only validation-overlay matches are retained as provisional audit evidence and excluded from primary metrics.
 
 Each run produces the scan report, raw alerts, clusters, pipeline results, parse diagnostics, rule audit, unmapped-alert audit, evaluation summary, classification metrics, calibration bins, and statistical output in the same run directory. Juice Shop and OWASP VulnerableApp are evaluated separately.
+
+Operational metrics use every final parsed assessment. The evaluator also writes
+`initial_only_evaluation_results.csv`, `initial_only_statistical_results.csv`, and
+`initial_only_calibration_results.csv`. This paired sensitivity population excludes a
+cluster from all three strategies whenever any strategy required repair or failed its
+initial parse, preventing repair-rate differences from being mistaken for a prompt
+strategy effect.
 
 If no validated positive rule matches, or parse quality is below the configured threshold, the run still completes and writes all audit artefacts with an explicit insufficient-evidence status. It does not manufacture invalid F1 or statistical results.
 
