@@ -87,9 +87,10 @@ GROUND_TRUTH_CANDIDATE_COLUMNS = (
 )
 TRIAGE_RESULT_COLUMNS = (
     "zap_alert_name", "app", "url", "cwe", "strategy", "llm_verdict",
-    "llm_confidence", "ground_truth_label", "matched_rule", "duplicate_count",
+    "llm_confidence", "assessment_origin", "repair_attempted", "repaired",
+    "ground_truth_label", "matched_rule", "duplicate_count",
 )
-TRIAGE_CHECKPOINT_VERSION = 1
+TRIAGE_CHECKPOINT_VERSION = 2
 TRIAGE_CHECKPOINT_FILE = "triage_checkpoint.jsonl"
 TRIAGE_CHECKPOINT_STATE_FILE = "triage_checkpoint_state.json"
 
@@ -132,19 +133,29 @@ BASE_INSTRUCTION = (
     "Always provide CVSS v3.1 AV, AC, PR, UI, and Scope metrics for the finding, even when "
     "you classify it as not confirmed."
 )
+STRATEGY_INSTRUCTIONS = {
+    "zero_shot": "Assess the ZAP alert directly using the supplied evidence.",
+    "few_shot": "Use the labelled generic ZAP examples as guidance, then assess the new alert independently.",
+    "cot": "Reason through vulnerability type, exploit evidence, and false-positive alternatives internally, then return only the concise JSON result.",
+}
+REPAIR_INSTRUCTION = (
+    "The response above failed strict parsing with this error: {parse_error}\n"
+    "Repair the response while preserving every recoverable substantive assessment value. "
+    "Do not replace a recoverable vulnerability type, CWE, verdict, confidence, severity, rationale, "
+    "recommended action, or CVSS value with a different assessment. If the response ended before all "
+    "required fields were emitted, complete only the missing or invalid fields from the same supplied "
+    "alert using the same strategy. Return exactly one schema-valid JSON object with no Markdown or prose."
+)
 ALERT_NAME_ALIASES: dict[str, set[str]] = {}
 _PROMPT_CACHE: dict[tuple[str, str], ChatPromptTemplate] = {}
+_REPAIR_PROMPT_CACHE: dict[tuple[str, str], ChatPromptTemplate] = {}
 
 
 def _prompt(strategy: str, examples: str = "") -> ChatPromptTemplate:
     key = (strategy, examples)
     if key in _PROMPT_CACHE:
         return _PROMPT_CACHE[key]
-    strategy_text = {
-        "zero_shot": "Assess the ZAP alert directly using the supplied evidence.",
-        "few_shot": "Use the labelled generic ZAP examples as guidance, then assess the new alert independently.",
-        "cot": "Reason through vulnerability type, exploit evidence, and false-positive alternatives internally, then return only the concise JSON result.",
-    }[strategy]
+    strategy_text = STRATEGY_INSTRUCTIONS[strategy]
     # Keep JSON examples as a partial value. Interpolating them directly into
     # the template would make LangChain interpret JSON braces as variables.
     examples_text = "\nGeneric development examples:\n{examples}\n" if strategy == "few_shot" else ""
@@ -159,6 +170,17 @@ def _prompt(strategy: str, examples: str = "") -> ChatPromptTemplate:
     ])
     _PROMPT_CACHE[key] = prompt.partial(examples=examples) if strategy == "few_shot" else prompt
     return _PROMPT_CACHE[key]
+
+
+def _repair_prompt(strategy: str, examples: str = "") -> ChatPromptTemplate:
+    key = (strategy, examples)
+    if key not in _REPAIR_PROMPT_CACHE:
+        continuation = ChatPromptTemplate.from_messages([
+            ("assistant", "{malformed_response}"),
+            ("human", REPAIR_INSTRUCTION),
+        ])
+        _REPAIR_PROMPT_CACHE[key] = _prompt(strategy, examples) + continuation
+    return _REPAIR_PROMPT_CACHE[key]
 
 
 def _trim(value, limit=1000) -> str:
@@ -592,6 +614,21 @@ def _examples_metadata(path: Path = EXAMPLES_PATH) -> dict:
     }
 
 
+def _triage_protocol_sha256(examples_metadata: dict | None = None) -> str:
+    metadata = examples_metadata or _examples_metadata()
+    payload = {
+        "checkpoint_version": TRIAGE_CHECKPOINT_VERSION,
+        "strategies": list(STRATEGIES),
+        "strategy_instructions": STRATEGY_INSTRUCTIONS,
+        "base_instruction": BASE_INSTRUCTION,
+        "repair_instruction": REPAIR_INSTRUCTION,
+        "assessment_schema": ASSESSMENT_SCHEMA,
+        "few_shot_examples_sha256": metadata["sha256"],
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def cvss31_exploitability(assessment: dict) -> float:
     av = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}[assessment["cvss_av"]]
     ac = {"L": 0.77, "H": 0.44}[assessment["cvss_ac"]]
@@ -600,11 +637,8 @@ def cvss31_exploitability(assessment: dict) -> float:
     return round(8.22 * av * ac * pr * ui, 4)
 
 
-def _repair_chain(llm):
-    return ChatPromptTemplate.from_messages([
-        ("system", "Return only a schema-valid JSON object for the same DAST alert."),
-        ("human", "The prior response was malformed. Reassess the supplied alert and return only the required JSON object.\n" + BASE_INSTRUCTION),
-    ]) | llm | StrOutputParser()
+def _repair_chain(llm, strategy: str, examples: str = ""):
+    return _repair_prompt(strategy, examples) | llm | StrOutputParser()
 
 
 def _cluster_ids_sha256(clusters: list[dict]) -> str:
@@ -623,13 +657,20 @@ def _checkpoint_paths(checkpoint_dir: Path) -> tuple[Path, Path]:
     )
 
 
-def _checkpoint_state(clusters: list[dict], run_id: str, model: str, completed: int) -> dict:
+def _checkpoint_state(
+    clusters: list[dict],
+    run_id: str,
+    model: str,
+    completed: int,
+    protocol_sha256: str,
+) -> dict:
     total = len(clusters) * len(STRATEGIES)
     return {
         "version": TRIAGE_CHECKPOINT_VERSION,
         "status": "in_progress",
         "run_id": run_id,
         "model": model,
+        "triage_protocol_sha256": protocol_sha256,
         "strategies": list(STRATEGIES),
         "cluster_count": len(clusters),
         "cluster_ids_sha256": _cluster_ids_sha256(clusters),
@@ -639,11 +680,25 @@ def _checkpoint_state(clusters: list[dict], run_id: str, model: str, completed: 
     }
 
 
-def _validate_checkpoint_state(state: dict, clusters: list[dict], run_id: str, model: str) -> None:
-    expected = _checkpoint_state(clusters, run_id, model, 0)
+def _validate_checkpoint_state(
+    state: dict,
+    clusters: list[dict],
+    run_id: str,
+    model: str,
+    protocol_sha256: str,
+) -> None:
+    expected = _checkpoint_state(clusters, run_id, model, 0, protocol_sha256)
+    if (
+        state.get("version") != TRIAGE_CHECKPOINT_VERSION
+        or state.get("triage_protocol_sha256") != protocol_sha256
+    ):
+        raise ValueError(
+            "Incompatible triage checkpoint protocol; start a new triage run from the "
+            "saved raw alerts with --reuse-from."
+        )
     for field in (
         "version", "run_id", "model", "strategies", "cluster_count",
-        "cluster_ids_sha256", "total_assessment_count",
+        "cluster_ids_sha256", "total_assessment_count", "triage_protocol_sha256",
     ):
         if state.get(field) != expected[field]:
             raise ValueError(
@@ -667,6 +722,7 @@ def _load_triage_checkpoint(
     clusters: list[dict],
     run_id: str,
     model: str,
+    protocol_sha256: str,
 ) -> dict[tuple[str, str], dict]:
     checkpoint_path, state_path = _checkpoint_paths(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -674,11 +730,14 @@ def _load_triage_checkpoint(
         state = _load_json(state_path)
         if not isinstance(state, dict):
             raise ValueError(f"Triage checkpoint state must be an object: {state_path}")
-        _validate_checkpoint_state(state, clusters, run_id, model)
+        _validate_checkpoint_state(state, clusters, run_id, model, protocol_sha256)
     elif checkpoint_path.exists() and checkpoint_path.stat().st_size:
         raise ValueError(f"Triage checkpoint data exists without state metadata: {checkpoint_path}")
     else:
-        _write_json(state_path, _checkpoint_state(clusters, run_id, model, 0))
+        _write_json(
+            state_path,
+            _checkpoint_state(clusters, run_id, model, 0, protocol_sha256),
+        )
 
     known_clusters = {cluster["cluster_id"] for cluster in clusters}
     records: dict[tuple[str, str], dict] = {}
@@ -710,7 +769,15 @@ def _load_triage_checkpoint(
             if not isinstance(record, dict):
                 raise ValueError(f"Triage checkpoint line {index + 1} must contain an object")
             if record.get("version") != TRIAGE_CHECKPOINT_VERSION:
-                raise ValueError(f"Unsupported triage checkpoint version at line {index + 1}")
+                raise ValueError(
+                    "Incompatible triage checkpoint protocol; start a new triage run from the "
+                    "saved raw alerts with --reuse-from."
+                )
+            if record.get("triage_protocol_sha256") != protocol_sha256:
+                raise ValueError(
+                    "Incompatible triage checkpoint protocol; start a new triage run from the "
+                    "saved raw alerts with --reuse-from."
+                )
             strategy = str(record.get("prompt_strategy", ""))
             cluster_id = str(record.get("cluster_id", ""))
             if strategy not in STRATEGIES or cluster_id not in known_clusters:
@@ -731,7 +798,10 @@ def _load_triage_checkpoint(
         _write_checkpoint_records(checkpoint_path, records)
     elif not checkpoint_path.exists():
         _write_checkpoint_records(checkpoint_path, records)
-    _write_json(state_path, _checkpoint_state(clusters, run_id, model, len(records)))
+    _write_json(
+        state_path,
+        _checkpoint_state(clusters, run_id, model, len(records), protocol_sha256),
+    )
     return records
 
 
@@ -744,6 +814,7 @@ def _append_triage_checkpoint(
     strategy: str,
     cluster_id: str,
     output: dict,
+    protocol_sha256: str,
 ) -> None:
     checkpoint_path, state_path = _checkpoint_paths(checkpoint_dir)
     key = (strategy, cluster_id)
@@ -751,6 +822,7 @@ def _append_triage_checkpoint(
         "version": TRIAGE_CHECKPOINT_VERSION,
         "run_id": run_id,
         "model": model,
+        "triage_protocol_sha256": protocol_sha256,
         "prompt_strategy": strategy,
         "cluster_id": cluster_id,
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -766,7 +838,10 @@ def _append_triage_checkpoint(
         file.flush()
         os.fsync(file.fileno())
     records[key] = record
-    _write_json(state_path, _checkpoint_state(clusters, run_id, model, len(records)))
+    _write_json(
+        state_path,
+        _checkpoint_state(clusters, run_id, model, len(records), protocol_sha256),
+    )
 
 
 def _remove_triage_checkpoint(checkpoint_dir: Path) -> None:
@@ -780,8 +855,15 @@ def _remove_triage_checkpoint(checkpoint_dir: Path) -> None:
 def _update_triage_stats(stats: dict, output: dict) -> None:
     stats["attempted_calls"] += 1
     stats["latencies"].append(float(output.get("inference_latency_seconds", 0.0)))
-    if output.get("initial_parse_error"):
+    initial_parsed = output.get("initial_parsed_successfully")
+    if initial_parsed is None:
+        initial_parsed = not bool(output.get("initial_parse_error"))
+    repair_attempted = output.get("repair_attempted")
+    if repair_attempted is None:
+        repair_attempted = bool(output.get("initial_parse_error"))
+    if not initial_parsed:
         stats["initial_failures"] += 1
+    if repair_attempted:
         stats["repair_attempts"] += 1
     if output.get("repaired"):
         stats["repair_successes"] += 1
@@ -795,21 +877,29 @@ def triage_clusters(
     model: str = MODEL,
     *,
     checkpoint_dir: Path | None = None,
+    protocol_sha256: str | None = None,
 ) -> tuple[list[dict], dict]:
     """Perform blinded inference. This function deliberately has no ground-truth inputs."""
     examples = _load_examples()
+    protocol_sha256 = protocol_sha256 or _triage_protocol_sha256()
     outputs: dict[str, dict[str, dict]] = {strategy: {} for strategy in STRATEGIES}
     checkpoint_records: dict[tuple[str, str], dict] = {}
     if checkpoint_dir is not None:
-        checkpoint_records = _load_triage_checkpoint(checkpoint_dir, clusters, run_id, model)
+        checkpoint_records = _load_triage_checkpoint(
+            checkpoint_dir,
+            clusters,
+            run_id,
+            model,
+            protocol_sha256,
+        )
         for (strategy, cluster_id), record in checkpoint_records.items():
             outputs[strategy][cluster_id] = record["output"]
     llm = _model(model)
-    repair_chain = _repair_chain(llm)
     diagnostics = {
         "metadata": {
             "run_id": run_id,
             "model": model,
+            "triage_protocol_sha256": protocol_sha256,
             "resumed_assessment_count": len(checkpoint_records),
         },
         "strategies": {},
@@ -821,6 +911,7 @@ def triage_clusters(
     )
     for strategy in STRATEGIES:
         chain = _prompt(strategy, examples) | llm | StrOutputParser()
+        repair_chain = _repair_chain(llm, strategy, examples)
         stats = {
             "attempted_calls": 0,
             "resumed_calls": 0,
@@ -864,26 +955,46 @@ def triage_clusters(
                 assessment = _parse_json(initial_raw)
             except Exception as error:
                 initial_error = str(error)
-                print("[nim]   Invalid JSON response; requesting format repair.", flush=True)
+                print(
+                    "[nim]   Invalid JSON response; requesting strategy-preserving format repair.",
+                    flush=True,
+                )
+                repair_payload = {
+                    **payload,
+                    "malformed_response": initial_raw,
+                    "parse_error": initial_error,
+                }
                 try:
                     repair_raw = _invoke(
                         repair_chain,
-                        payload,
+                        repair_payload,
                         progress=progress,
-                        request_kind="format repair",
+                        request_kind="strategy-preserving format repair",
                     )
                 except Exception as repair_request_error:
                     progress.fail_assessment(repair_request_error)
-                    raise
-                try:
-                    assessment = _parse_json(repair_raw)
-                    repaired = True
-                except Exception as parse_error:
-                    repair_error = str(parse_error)
+                    repair_error = f"Repair request failed: {repair_request_error}"
+                else:
+                    try:
+                        assessment = _parse_json(repair_raw)
+                        repaired = True
+                    except Exception as parse_error:
+                        repair_error = str(parse_error)
+            initial_parsed_successfully = not bool(initial_error)
+            repair_attempted = bool(initial_error)
+            if initial_parsed_successfully:
+                assessment_origin = "initial"
+            elif repaired:
+                assessment_origin = "strategy_preserving_repair"
+            else:
+                assessment_origin = "unparsed"
             output = {
                 "initial_response": initial_raw, "repair_response": repair_raw,
                 "initial_parse_error": initial_error, "repair_parse_error": repair_error,
+                "initial_parsed_successfully": initial_parsed_successfully,
+                "repair_attempted": repair_attempted,
                 "repaired": repaired,
+                "assessment_origin": assessment_origin,
                 "parsed_successfully": assessment is not None, "inference_latency_seconds": latency,
             }
             if assessment is None:
@@ -909,10 +1020,14 @@ def triage_clusters(
                     strategy,
                     cluster["cluster_id"],
                     output,
+                    protocol_sha256,
                 )
             progress.complete_assessment(assessment is not None, repaired)
         diagnostics["strategies"][strategy] = {
             **stats,
+            "initial_parse_success_rate": (stats["attempted_calls"] - stats["initial_failures"]) / stats["attempted_calls"] if stats["attempted_calls"] else 0.0,
+            "repair_success_rate": stats["repair_successes"] / stats["repair_attempts"] if stats["repair_attempts"] else None,
+            "final_parse_success_rate": (stats["attempted_calls"] - stats["unrecoverable_failures"]) / stats["attempted_calls"] if stats["attempted_calls"] else 0.0,
             "parse_success_rate": (stats["attempted_calls"] - stats["unrecoverable_failures"]) / stats["attempted_calls"] if stats["attempted_calls"] else 0.0,
             "mean_latency_seconds": mean(stats["latencies"]) if stats["latencies"] else 0.0,
         }
@@ -1238,6 +1353,144 @@ def write_validation_coverage_artifacts(run_dir: Path, audit: list[dict]) -> dic
     return summary
 
 
+def _assessment_origin(record: dict) -> str:
+    origin = str(record.get("assessment_origin", "")).strip()
+    if origin in {"initial", "strategy_preserving_repair", "legacy_repair", "unparsed"}:
+        return origin
+    if record.get("repaired"):
+        return "legacy_repair"
+    return "initial" if record.get("parsed_successfully") else "unparsed"
+
+
+def _cluster_records(by_strategy: dict[str, dict[str, dict]]) -> dict[str, dict[str, dict]]:
+    clustered = {strategy: {} for strategy in STRATEGIES}
+    for strategy in STRATEGIES:
+        for record in by_strategy[strategy].values():
+            cluster_id = str(record.get("cluster_id", ""))
+            existing = clustered[strategy].setdefault(cluster_id, record)
+            if _assessment_origin(existing) != _assessment_origin(record):
+                raise ValueError(
+                    f"Cluster {cluster_id} has inconsistent assessment provenance for {strategy}"
+                )
+    return clustered
+
+
+def _evaluate_cluster_population(
+    apps: set[str],
+    population_clusters: set[str],
+    cluster_labels: dict[str, bool],
+    cluster_apps: dict[str, str],
+    records_by_cluster: dict[str, dict[str, dict]],
+    parse_rates: dict[str, float],
+) -> tuple[dict, list[dict], list[dict], list[dict]]:
+    app_status = {}
+    metrics_rows, calibration_rows, stats_rows = [], [], []
+    for app in sorted(apps):
+        app_clusters = {
+            cluster_id
+            for cluster_id in population_clusters
+            if cluster_apps.get(cluster_id) == app
+        }
+        positives = sum(cluster_labels[cluster_id] for cluster_id in app_clusters)
+        negatives = len(app_clusters) - positives
+        if not positives:
+            app_status[app] = "insufficient_validated_positives"
+            continue
+        if not negatives:
+            app_status[app] = "insufficient_validated_negatives"
+            continue
+        app_status[app] = "complete"
+        correctness = {}
+        for strategy in STRATEGIES:
+            rows = []
+            for cluster_id in sorted(app_clusters):
+                record = records_by_cluster[strategy][cluster_id]
+                rows.append(
+                    (
+                        cluster_labels[cluster_id],
+                        bool(record["confirmed"]),
+                        float(record["confidence"]),
+                    )
+                )
+            y_true = np.array([row[0] for row in rows], dtype=int)
+            y_pred = np.array([row[1] for row in rows], dtype=int)
+            confidence = np.array([row[2] for row in rows], dtype=float)
+            ece, bins = _ece(y_true, confidence)
+            report = classification_report(
+                y_true,
+                y_pred,
+                labels=[0, 1],
+                target_names=["SAFE", "VULNERABLE"],
+                output_dict=True,
+                zero_division=0,
+            )
+            metrics_rows.append({
+                "app": app, "prompt_strategy": strategy,
+                "precision": precision_score(y_true, y_pred, zero_division=0),
+                "recall": recall_score(y_true, y_pred, zero_division=0),
+                "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
+                "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+                "kappa": cohen_kappa_score(y_true, y_pred),
+                "brier_score": brier_score_loss(y_true, confidence), "ece": ece,
+                "signed_calibration_gap": float((confidence - y_true).mean()),
+                "sample_count": len(rows), "positive_count": int(y_true.sum()),
+                "negative_count": int((y_true == 0).sum()),
+                "parse_success_rate": parse_rates[strategy],
+                "false_negative_count": int(((y_true == 1) & (y_pred == 0)).sum()),
+                "prediction_distribution": json.dumps({
+                    "predicted_vulnerable": int(y_pred.sum()),
+                    "predicted_safe": int((y_pred == 0).sum()),
+                    "actual_vulnerable": int(y_true.sum()),
+                    "actual_safe": int((y_true == 0).sum()),
+                }),
+                "classification_report": json.dumps({
+                    label: report[label] for label in ("SAFE", "VULNERABLE")
+                }),
+            })
+            calibration_rows.extend([
+                {**bin_row, "app": app, "prompt_strategy": strategy}
+                for bin_row in bins
+            ])
+            correctness[strategy] = (y_true == y_pred).astype(int).tolist()
+        primary = _mcnemar(correctness["zero_shot"], correctness["cot"])
+        stats_rows.append({
+            "app": app, "test": "mcnemar_primary", "comparison": "cot vs zero_shot",
+            **primary,
+        })
+        for first, second in combinations(STRATEGIES, 2):
+            result = _mcnemar(correctness[first], correctness[second])
+            stats_rows.append({
+                "app": app, "test": "mcnemar_secondary",
+                "comparison": f"{first} vs {second}", **result,
+            })
+        if len(next(iter(correctness.values()))) >= 2 and not (
+            np.array_equal(correctness["zero_shot"], correctness["few_shot"])
+            and np.array_equal(correctness["zero_shot"], correctness["cot"])
+        ):
+            friedman = friedmanchisquare(*[correctness[strategy] for strategy in STRATEGIES])
+            stats_rows.append({
+                "app": app, "test": "friedman", "comparison": "all strategies",
+                "statistic": float(friedman.statistic), "p_value": float(friedman.pvalue),
+            })
+        stats_rows.extend(
+            {"app": app, "test": "wilcoxon_secondary", **row}
+            for row in _wilcoxon(correctness)
+        )
+    return app_status, metrics_rows, calibration_rows, stats_rows
+
+
+def _population_status(app_status: dict, positive_count: int) -> str:
+    if not positive_count:
+        return "insufficient_validated_positives"
+    if any(value == "complete" for value in app_status.values()):
+        return (
+            "complete"
+            if all(value == "complete" for value in app_status.values())
+            else "complete_partial"
+        )
+    return "insufficient_validated_labels"
+
+
 def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) -> dict:
     """Apply independent rules only after pipeline results have been persisted."""
     by_strategy = _validate_pairs(records)
@@ -1268,6 +1521,11 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
                 "strategy": strategy,
                 "llm_verdict": record.get("confirmed", ""),
                 "llm_confidence": record.get("confidence", ""),
+                "assessment_origin": _assessment_origin(record),
+                "repair_attempted": bool(
+                    record.get("repair_attempted", record.get("initial_parse_error"))
+                ),
+                "repaired": bool(record.get("repaired", False)),
                 "ground_truth_label": match["ground_truth_label"],
                 "matched_rule": match["matched_rule_id"],
                 "duplicate_count": record.get("dedup_cluster_size", 1),
@@ -1276,6 +1534,17 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
         run_dir / "triage_results.csv", index=False,
     )
     parsed_rates = {strategy: diagnostics["strategies"][strategy]["parse_success_rate"] for strategy in STRATEGIES}
+    initial_parsed_rates = {}
+    for strategy in STRATEGIES:
+        strategy_diagnostics = diagnostics["strategies"][strategy]
+        if "initial_parse_success_rate" in strategy_diagnostics:
+            initial_parsed_rates[strategy] = strategy_diagnostics["initial_parse_success_rate"]
+        else:
+            attempted = int(strategy_diagnostics.get("attempted_calls", 0))
+            failures = int(strategy_diagnostics.get("initial_failures", 0))
+            initial_parsed_rates[strategy] = (
+                (attempted - failures) / attempted if attempted else parsed_rates[strategy]
+            )
     parse_blocked = [strategy for strategy, rate in parsed_rates.items() if rate < PARSE_SUCCESS_THRESHOLD]
     cluster_labels: dict[str, bool] = {}
     for row in audit:
@@ -1289,77 +1558,116 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
         if all(by_strategy[strategy][alert_id]["parsed_successfully"] for strategy in STRATEGIES for alert_id, row in by_strategy[strategy].items() if row["cluster_id"] == cluster_id)
     }
     mapped_clusters = set(cluster_labels)
+    records_by_cluster = _cluster_records(by_strategy)
+    cluster_apps = {
+        row["cluster_id"]: row["app"]
+        for row in audit
+        if row["cluster_id"] in mapped_clusters
+    }
+    apps = {row["app"] for row in audit}
     eligible_clusters = complete_clusters if not parse_blocked else set()
-    app_status = {}
-    metrics_rows, calibration_rows, stats_rows = [], [], []
-    for app in sorted({row["app"] for row in audit}):
-        app_clusters = {cluster_id for cluster_id in eligible_clusters if next(row["app"] for row in audit if row["cluster_id"] == cluster_id) == app}
-        positives = sum(cluster_labels[cluster_id] for cluster_id in app_clusters)
-        negatives = len(app_clusters) - positives
-        if parse_blocked:
-            app_status[app] = "insufficient_parse_quality"
-            continue
-        if not positives:
-            app_status[app] = "insufficient_validated_positives"
-            continue
-        if not negatives:
-            app_status[app] = "insufficient_validated_negatives"
-            continue
-        app_status[app] = "complete"
-        correctness = {}
-        for strategy in STRATEGIES:
-            rows = []
-            for cluster_id in sorted(app_clusters):
-                record = next(record for record in by_strategy[strategy].values() if record["cluster_id"] == cluster_id)
-                rows.append((cluster_labels[cluster_id], bool(record["confirmed"]), float(record["confidence"])))
-            y_true = np.array([row[0] for row in rows], dtype=int)
-            y_pred = np.array([row[1] for row in rows], dtype=int)
-            confidence = np.array([row[2] for row in rows], dtype=float)
-            ece, bins = _ece(y_true, confidence)
-            report = classification_report(y_true, y_pred, labels=[0, 1], target_names=["SAFE", "VULNERABLE"], output_dict=True, zero_division=0)
-            metrics_rows.append({
-                "app": app, "prompt_strategy": strategy,
-                "precision": precision_score(y_true, y_pred, zero_division=0), "recall": recall_score(y_true, y_pred, zero_division=0),
-                "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0), "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
-                "kappa": cohen_kappa_score(y_true, y_pred), "brier_score": brier_score_loss(y_true, confidence), "ece": ece,
-                "signed_calibration_gap": float((confidence - y_true).mean()), "sample_count": len(rows), "positive_count": int(y_true.sum()), "negative_count": int((y_true == 0).sum()),
-                "parse_success_rate": parsed_rates[strategy], "false_negative_count": int(((y_true == 1) & (y_pred == 0)).sum()),
-                "prediction_distribution": json.dumps({"predicted_vulnerable": int(y_pred.sum()), "predicted_safe": int((y_pred == 0).sum()), "actual_vulnerable": int(y_true.sum()), "actual_safe": int((y_true == 0).sum())}),
-                "classification_report": json.dumps({label: report[label] for label in ("SAFE", "VULNERABLE")}),
-            })
-            calibration_rows.extend([{**bin_row, "app": app, "prompt_strategy": strategy} for bin_row in bins])
-            correctness[strategy] = (y_true == y_pred).astype(int).tolist()
-        primary = _mcnemar(correctness["zero_shot"], correctness["cot"])
-        stats_rows.append({"app": app, "test": "mcnemar_primary", "comparison": "cot vs zero_shot", **primary})
-        for first, second in combinations(STRATEGIES, 2):
-            result = _mcnemar(correctness[first], correctness[second])
-            stats_rows.append({"app": app, "test": "mcnemar_secondary", "comparison": f"{first} vs {second}", **result})
-        if len(next(iter(correctness.values()))) >= 2 and not (np.array_equal(correctness["zero_shot"], correctness["few_shot"]) and np.array_equal(correctness["zero_shot"], correctness["cot"])):
-            friedman = friedmanchisquare(*[correctness[strategy] for strategy in STRATEGIES])
-            stats_rows.append({"app": app, "test": "friedman", "comparison": "all strategies", "statistic": float(friedman.statistic), "p_value": float(friedman.pvalue)})
-        stats_rows.extend({"app": app, "test": "wilcoxon_secondary", **row} for row in _wilcoxon(correctness))
+    if parse_blocked:
+        app_status = {app: "insufficient_parse_quality" for app in sorted(apps)}
+        metrics_rows, calibration_rows, stats_rows = [], [], []
+    else:
+        app_status, metrics_rows, calibration_rows, stats_rows = _evaluate_cluster_population(
+            apps,
+            eligible_clusters,
+            cluster_labels,
+            cluster_apps,
+            records_by_cluster,
+            parsed_rates,
+        )
+
+    repair_free_clusters = {
+        cluster_id
+        for cluster_id in complete_clusters
+        if all(
+            _assessment_origin(records_by_cluster[strategy][cluster_id]) == "initial"
+            for strategy in STRATEGIES
+        )
+    }
+    repaired_cluster_counts = {
+        strategy: sum(
+            _assessment_origin(records_by_cluster[strategy][cluster_id])
+            in {"strategy_preserving_repair", "legacy_repair"}
+            for cluster_id in mapped_clusters
+            if cluster_id in records_by_cluster[strategy]
+        )
+        for strategy in STRATEGIES
+    }
+    (
+        sensitivity_app_status,
+        sensitivity_metrics_rows,
+        sensitivity_calibration_rows,
+        sensitivity_stats_rows,
+    ) = _evaluate_cluster_population(
+        apps,
+        repair_free_clusters,
+        cluster_labels,
+        cluster_apps,
+        records_by_cluster,
+        initial_parsed_rates,
+    )
 
     total_validated_positive = sum(row["ground_truth_label"] == "VULNERABLE" for row in audit)
     if parse_blocked:
         status = "insufficient_parse_quality"
     elif not total_validated_positive:
         status = "insufficient_validated_positives"
-    elif any(value == "complete" for value in app_status.values()):
-        status = "complete" if all(value == "complete" for value in app_status.values()) else "complete_partial"
     else:
-        status = "insufficient_validated_labels"
+        status = _population_status(app_status, total_validated_positive)
+    sensitivity_positive_count = sum(
+        cluster_labels[cluster_id] for cluster_id in repair_free_clusters
+    )
+    sensitivity_status = _population_status(
+        sensitivity_app_status,
+        sensitivity_positive_count,
+    )
+    serialized_sensitivity_metrics = [
+        {
+            **row,
+            "prediction_distribution": json.loads(row["prediction_distribution"]),
+            "classification_report": json.loads(row["classification_report"]),
+        }
+        for row in sensitivity_metrics_rows
+    ]
     summary = {
         "evaluation_status": status, "app_status": app_status,
         "coverage": {"raw_alert_count": len(audit), "validated_mapped_alert_count": sum(row["ground_truth_label"] in {"VULNERABLE", "NOT_VULNERABLE"} for row in audit), "validated_positive_alert_count": total_validated_positive, "unmapped_alert_count": sum(row["ground_truth_label"] == "UNMAPPED" for row in audit), "provisional_alert_count": sum(row["ground_truth_label"] == "PROVISIONAL" for row in audit)},
         "parse_quality": {"threshold": PARSE_SUCCESS_THRESHOLD, "strategies": parsed_rates, "below_threshold_strategies": parse_blocked, "complete_mapped_cluster_count": len(complete_clusters), "excluded_mapped_cluster_count": len(mapped_clusters - complete_clusters)},
         "metrics": [{**row, "prediction_distribution": json.loads(row["prediction_distribution"]), "classification_report": json.loads(row["classification_report"])} for row in metrics_rows],
         "statistics": stats_rows,
+        "initial_only_sensitivity": {
+            "evaluation_status": sensitivity_status,
+            "policy": (
+                "Exclude a mapped cluster from every strategy when any strategy used repair "
+                "or failed initial parsing."
+            ),
+            "mapped_cluster_count": len(mapped_clusters),
+            "eligible_cluster_count": len(repair_free_clusters),
+            "excluded_cluster_count": len(mapped_clusters - repair_free_clusters),
+            "repaired_cluster_count_by_strategy": repaired_cluster_counts,
+            "initial_parse_success_rate_by_strategy": initial_parsed_rates,
+            "app_status": sensitivity_app_status,
+            "metrics": serialized_sensitivity_metrics,
+            "statistics": sensitivity_stats_rows,
+        },
         "validation_coverage": validation_coverage,
     }
     _write_json(run_dir / "evaluation_summary.json", summary)
     pd.DataFrame(metrics_rows).to_csv(run_dir / "evaluation_results.csv", index=False)
     pd.DataFrame(stats_rows).to_csv(run_dir / "statistical_results.csv", index=False)
     pd.DataFrame(calibration_rows).to_csv(run_dir / "calibration_results.csv", index=False)
+    pd.DataFrame(sensitivity_metrics_rows).to_csv(
+        run_dir / "initial_only_evaluation_results.csv", index=False,
+    )
+    pd.DataFrame(sensitivity_stats_rows).to_csv(
+        run_dir / "initial_only_statistical_results.csv", index=False,
+    )
+    pd.DataFrame(sensitivity_calibration_rows).to_csv(
+        run_dir / "initial_only_calibration_results.csv", index=False,
+    )
     return summary
 
 
@@ -1370,6 +1678,8 @@ def run_automated(
     run_id = run_dir.name
     canonical = [canonical_alert(alert, index) for index, alert in enumerate(alerts)]
     clusters = deduplicate_alerts(canonical)
+    examples_metadata = _examples_metadata()
+    protocol_sha256 = _triage_protocol_sha256(examples_metadata)
     if create_run_dir:
         run_dir.mkdir(parents=True, exist_ok=False)
     elif not run_dir.is_dir():
@@ -1389,6 +1699,11 @@ def run_automated(
                     f"Resume manifest {field} mismatch: expected {value!r}, "
                     f"found {manifest.get(field)!r}"
                 )
+        if manifest.get("triage_protocol_sha256") != protocol_sha256:
+            raise ValueError(
+                "Incompatible triage checkpoint protocol; start a new triage run from the "
+                "saved raw alerts with --reuse-from."
+            )
         saved_clusters = _load_json(run_dir / "clusters.json")
         if not isinstance(saved_clusters, list) or _cluster_ids_sha256(saved_clusters) != _cluster_ids_sha256(clusters):
             raise ValueError("Resume source does not match the saved triage clusters")
@@ -1397,7 +1712,9 @@ def run_automated(
             "run_id": run_id, "created_at_utc": datetime.now(timezone.utc).isoformat(), "git_revision": _git_revision(),
             "scan_profile": scan_profile, "targets": TARGETS, "model": model, "nim_base_url": NIM_BASE_URL,
             "temperature": TEMPERATURE, "max_completion_tokens": MAX_COMPLETION_TOKENS, "strategies": STRATEGIES,
-            "prompt_template_version": "automated-post-triage-v1", "few_shot_examples": _examples_metadata(),
+            "prompt_template_version": "automated-post-triage-v2-repair-context",
+            "triage_protocol_sha256": protocol_sha256,
+            "few_shot_examples": examples_metadata,
             "source_alert_count": len(canonical), "cluster_count": len(clusters),
         }
         if source_raw_alerts is not None:
@@ -1407,7 +1724,13 @@ def run_automated(
         _write_json(run_dir / "clusters.json", clusters)
     print(f"[nim] Triaging {len(clusters)} unique alert clusters with {model}.", flush=True)
     try:
-        records, diagnostics = triage_clusters(clusters, run_id, model, checkpoint_dir=run_dir)
+        records, diagnostics = triage_clusters(
+            clusters,
+            run_id,
+            model,
+            checkpoint_dir=run_dir,
+            protocol_sha256=protocol_sha256,
+        )
     except (Exception, KeyboardInterrupt):
         checkpoint_path, state_path = _checkpoint_paths(run_dir)
         completed = 0

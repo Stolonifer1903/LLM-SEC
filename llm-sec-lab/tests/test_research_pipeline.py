@@ -200,6 +200,109 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
         })
         self.assertIn("Generic development examples", message.to_string())
 
+    def test_repair_prompt_replays_strategy_alert_and_malformed_response(self):
+        examples = pipeline._load_examples()
+        payload = {
+            "alert_name": "SQL Injection marker",
+            "risk": "High marker",
+            "zap_confidence": "Medium marker",
+            "url": "https://target.invalid/route-marker",
+            "description": "description marker",
+            "evidence": "database evidence marker",
+            "param": "parameter marker",
+            "attack": "attack marker",
+            "malformed_response": '{"vulnerability_type":"SQL Injection","cwe_id":',
+            "parse_error": "No JSON object found marker",
+        }
+        for strategy in pipeline.STRATEGIES:
+            message = pipeline._repair_prompt(strategy, examples).invoke(payload).to_string()
+            self.assertIn(pipeline.STRATEGY_INSTRUCTIONS[strategy], message)
+            for value in payload.values():
+                self.assertIn(value, message)
+            if strategy == "few_shot":
+                self.assertIn("Generic development examples", message)
+            else:
+                self.assertNotIn("Generic development examples", message)
+
+    def test_strategy_preserving_repair_keeps_sql_injection_family_and_cwe(self):
+        alert = self.alert(
+            0,
+            name="SQL Injection",
+            cwe="89",
+            evidence="database syntax error",
+            url="http://target.invalid/search?id=1%27",
+        )
+        repaired = json.dumps({
+            "confirmed": True, "confidence": 0.9,
+            "vulnerability_type": "SQL Injection", "cwe_id": "CWE-89",
+            "severity": "High", "rationale": "Database evidence supports SQL injection.",
+            "recommended_action": "Use parameterized queries.",
+            "cvss_av": "N", "cvss_ac": "L", "cvss_pr": "N",
+            "cvss_ui": "N", "cvss_s": "U",
+        })
+        calls = []
+
+        def invoke(_chain, payload, **kwargs):
+            calls.append((payload, kwargs["request_kind"]))
+            if kwargs["request_kind"] == "primary":
+                return '{"confirmed":true,"vulnerability_type":"SQL Injection","cwe_id":'
+            return repaired
+
+        chain = FakeChain()
+        with (
+            patch.object(pipeline, "_model", return_value=object()),
+            patch.object(pipeline, "_prompt", return_value=FakePrompt(chain)),
+            patch.object(pipeline, "_repair_chain", return_value=chain),
+            patch.object(pipeline, "_invoke", side_effect=invoke),
+            patch.object(pipeline, "load_automated_rules") as load_rules,
+        ):
+            records, diagnostics = pipeline.triage_clusters(
+                pipeline.deduplicate_alerts([alert]), "fixture",
+            )
+
+        self.assertFalse(load_rules.called)
+        self.assertEqual(len(calls), len(pipeline.STRATEGIES) * 2)
+        self.assertTrue(all(row["vulnerability_type"] == "SQL Injection" for row in records))
+        self.assertTrue(all(row["cwe_id"] == "CWE-89" for row in records))
+        self.assertTrue(all(row["repair_attempted"] for row in records))
+        self.assertTrue(all(row["repaired"] for row in records))
+        self.assertTrue(all(row["assessment_origin"] == "strategy_preserving_repair" for row in records))
+        repair_payloads = [payload for payload, kind in calls if kind != "primary"]
+        self.assertTrue(all("SQL Injection" in payload["malformed_response"] for payload in repair_payloads))
+        self.assertTrue(all(payload["parse_error"] for payload in repair_payloads))
+        for strategy in pipeline.STRATEGIES:
+            stats = diagnostics["strategies"][strategy]
+            self.assertEqual(stats["initial_parse_success_rate"], 0.0)
+            self.assertEqual(stats["repair_success_rate"], 1.0)
+            self.assertEqual(stats["final_parse_success_rate"], 1.0)
+
+    def test_exhausted_repair_request_fails_closed_without_stopping_triage(self):
+        chain = FakeChain()
+
+        def invoke(_chain, _payload, **kwargs):
+            if kwargs["request_kind"] == "primary":
+                return "not json"
+            raise RuntimeError("repair unavailable")
+
+        with (
+            patch.object(pipeline, "_model", return_value=object()),
+            patch.object(pipeline, "_prompt", return_value=FakePrompt(chain)),
+            patch.object(pipeline, "_repair_chain", return_value=chain),
+            patch.object(pipeline, "_invoke", side_effect=invoke),
+        ):
+            records, diagnostics = pipeline.triage_clusters(
+                pipeline.deduplicate_alerts([self.alert(0)]), "fixture",
+            )
+
+        self.assertEqual(len(records), len(pipeline.STRATEGIES))
+        self.assertTrue(all(row["confirmed"] is None for row in records))
+        self.assertTrue(all(row["assessment_origin"] == "unparsed" for row in records))
+        self.assertTrue(all("repair unavailable" in row["repair_parse_error"] for row in records))
+        self.assertEqual(
+            sum(row["unrecoverable_failures"] for row in diagnostics["strategies"].values()),
+            len(pipeline.STRATEGIES),
+        )
+
     def test_triage_processes_every_cluster_without_loading_ground_truth(self):
         clusters = pipeline.deduplicate_alerts([self.alert(0), self.alert(1, evidence="different")])
         chain = FakeChain()
@@ -283,6 +386,12 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                 (run_dir / pipeline.TRIAGE_CHECKPOINT_STATE_FILE).read_text(encoding="utf-8")
             )
             self.assertEqual(state["completed_assessment_count"], 1)
+            self.assertEqual(
+                state["triage_protocol_sha256"],
+                json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))[
+                    "triage_protocol_sha256"
+                ],
+            )
             self.assertEqual(len(checkpoint.read_text(encoding="utf-8").splitlines()), 1)
             with checkpoint.open("a", encoding="utf-8") as file:
                 file.write('{"partial"')
@@ -306,6 +415,23 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                 (run_dir / "parse_diagnostics.json").read_text(encoding="utf-8")
             )
             self.assertEqual(diagnostics["metadata"]["resumed_assessment_count"], 1)
+
+    def test_checkpoint_rejects_protocol_fingerprint_mismatch(self):
+        clusters = pipeline.deduplicate_alerts([self.alert(0)])
+        protocol_sha256 = pipeline._triage_protocol_sha256()
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            state = pipeline._checkpoint_state(
+                clusters, "fixture", pipeline.MODEL, 0, protocol_sha256,
+            )
+            state["triage_protocol_sha256"] = "old-protocol"
+            (run_dir / pipeline.TRIAGE_CHECKPOINT_STATE_FILE).write_text(
+                json.dumps(state), encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "start a new triage run"):
+                pipeline._load_triage_checkpoint(
+                    run_dir, clusters, "fixture", pipeline.MODEL, protocol_sha256,
+                )
 
     def test_scan_only_writes_scan_artifacts_without_triage(self):
         alerts = [{"app": "juice_shop", "alert_name": "Example", "url": "http://juice-shop:3000/"}]
@@ -561,6 +687,72 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
             self.assertEqual(len(triage), len(pipeline.STRATEGIES))
             self.assertEqual(set(triage["duplicate_count"]), {1})
 
+    def test_initial_only_sensitivity_excludes_repaired_cluster_from_every_strategy(self):
+        cluster_specs = [
+            ("positive_initial", "0", True, "initial"),
+            ("positive_repaired", "1", True, "initial"),
+            ("negative_initial", "2", False, "initial"),
+        ]
+        records = []
+        for strategy in pipeline.STRATEGIES:
+            for cluster_id, alert_id, confirmed, default_origin in cluster_specs:
+                origin = (
+                    "strategy_preserving_repair"
+                    if strategy == "zero_shot" and cluster_id == "positive_repaired"
+                    else default_origin
+                )
+                records.append({
+                    "alert_id": alert_id, "cluster_id": cluster_id, "app": "juice_shop",
+                    "alert_name": "SQL Injection" if confirmed else "Timestamp Disclosure - Unix",
+                    "zap_cwe_id": "CWE-89" if confirmed else "CWE-497",
+                    "url": f"http://target.invalid/{cluster_id}", "evidence": "fixture",
+                    "pluginid": "40018", "risk": "High" if confirmed else "Low",
+                    "prompt_strategy": strategy, "parsed_successfully": True,
+                    "initial_parsed_successfully": origin == "initial",
+                    "repair_attempted": origin != "initial", "repaired": origin != "initial",
+                    "assessment_origin": origin, "confirmed": confirmed,
+                    "confidence": 0.9 if confirmed else 0.1,
+                })
+        audit = [
+            {
+                "alert_id": alert_id, "cluster_id": cluster_id, "app": "juice_shop",
+                "alert_name": "SQL Injection" if confirmed else "Timestamp Disclosure - Unix",
+                "zap_cwe_id": "CWE-89" if confirmed else "CWE-497",
+                "ground_truth_label": "VULNERABLE" if confirmed else "NOT_VULNERABLE",
+                "matched_rule_id": f"rule_{cluster_id}", "rule_status": "validated",
+                "provider_key": "provider" if confirmed else "", "rationale": "fixture",
+                "validation_basis": "fixture", "source_ref": "fixture",
+            }
+            for cluster_id, alert_id, confirmed, _origin in cluster_specs
+        ]
+        diagnostics = {"strategies": {
+            strategy: {
+                "parse_success_rate": 1.0,
+                "initial_parse_success_rate": 2 / 3 if strategy == "zero_shot" else 1.0,
+            }
+            for strategy in pipeline.STRATEGIES
+        }}
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            with (
+                patch.object(pipeline, "load_automated_rules", return_value=([], [])),
+                patch.object(pipeline, "build_match_audit", return_value=audit),
+                patch.object(pipeline, "write_validation_coverage_artifacts", return_value={}),
+            ):
+                summary = pipeline.evaluate_post_triage(run_dir, records, diagnostics)
+
+            operational = {row["prompt_strategy"]: row for row in summary["metrics"]}
+            sensitivity = summary["initial_only_sensitivity"]
+            sensitivity_metrics = {
+                row["prompt_strategy"]: row for row in sensitivity["metrics"]
+            }
+            self.assertTrue(all(row["sample_count"] == 3 for row in operational.values()))
+            self.assertTrue(all(row["sample_count"] == 2 for row in sensitivity_metrics.values()))
+            self.assertEqual(sensitivity["eligible_cluster_count"], 2)
+            self.assertEqual(sensitivity["excluded_cluster_count"], 1)
+            self.assertEqual(sensitivity["repaired_cluster_count_by_strategy"]["zero_shot"], 1)
+            self.assertTrue((run_dir / "initial_only_evaluation_results.csv").is_file())
+
     def test_parse_failure_never_becomes_safe_prediction(self):
         clusters = pipeline.deduplicate_alerts([self.alert(0)])
         chain = FakeChain()
@@ -572,6 +764,9 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
         ):
             records, diagnostics = pipeline.triage_clusters(clusters, "fixture")
         self.assertTrue(all(row["confirmed"] is None for row in records))
+        self.assertTrue(all(row["assessment_origin"] == "unparsed" for row in records))
+        self.assertTrue(all(row["repair_attempted"] for row in records))
+        self.assertTrue(all(not row["repaired"] for row in records))
         self.assertEqual(sum(row["unrecoverable_failures"] for row in diagnostics["strategies"].values()), 3)
 
 
