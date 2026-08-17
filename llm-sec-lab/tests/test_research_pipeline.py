@@ -108,7 +108,7 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
     @staticmethod
     def assessment(confirmed=False):
         return json.dumps({
-            "confirmed": confirmed, "confidence": 0.2 if not confirmed else 0.9,
+            "vulnerability_probability": 0.2 if not confirmed else 0.9,
             "vulnerability_type": "Information Disclosure", "cwe_id": "CWE-497",
             "severity": "Low", "rationale": "Evidence reviewed.",
             "recommended_action": "Investigate", "cvss_av": "N", "cvss_ac": "L",
@@ -188,7 +188,12 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
     def test_bundled_examples_are_generic_balanced_and_source_cited(self):
         rows = json.loads(pipeline._load_examples())
         self.assertEqual(len(rows), 4)
-        self.assertEqual(sum(row["confirmed"] for row in rows), 2)
+        self.assertEqual(
+            sum(row["vulnerability_probability"] >= pipeline.VERDICT_THRESHOLD for row in rows),
+            2,
+        )
+        self.assertTrue(all(set(pipeline.ASSESSMENT_SCHEMA["required"]) <= set(row) for row in rows))
+        self.assertTrue(all("confidence" not in row and "confirmed" not in row for row in rows))
         self.assertTrue(all(row["source_url"].startswith("https://") for row in rows))
         self.assertFalse(any("vulnerable_app" in json.dumps(row).lower() for row in rows))
 
@@ -199,6 +204,47 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
             "evidence": "evidence", "param": "", "attack": "",
         })
         self.assertIn("Generic development examples", message.to_string())
+
+    def test_every_strategy_uses_the_exact_probability_contract(self):
+        examples = pipeline._load_examples()
+        payload = {
+            "alert_name": "Example", "risk": "Low", "zap_confidence": "Low",
+            "url": "https://target.invalid/", "description": "description",
+            "evidence": "evidence", "param": "", "attack": "",
+        }
+        for strategy in pipeline.STRATEGIES:
+            prompt = pipeline._prompt(strategy, examples).invoke(payload).to_string()
+            self.assertIn(pipeline.PROBABILITY_EVENT, prompt)
+            self.assertIn("only the supplied alert fields", prompt)
+            self.assertIn("do not return a confirmed or confidence field", prompt)
+
+    def test_probability_contract_derives_boolean_at_half_threshold(self):
+        below = json.loads(self.assessment(False))
+        below["vulnerability_probability"] = 0.4999
+        boundary = {**below, "vulnerability_probability": 0.5}
+        parsed_below = pipeline._parse_json(json.dumps(below))
+        parsed_boundary = pipeline._parse_json(json.dumps(boundary))
+        self.assertFalse(parsed_below["confirmed"])
+        self.assertTrue(parsed_boundary["confirmed"])
+        self.assertEqual(parsed_boundary["verdict_threshold"], 0.5)
+        self.assertEqual(
+            parsed_boundary["probability_contract_version"],
+            pipeline.PROBABILITY_CONTRACT_VERSION,
+        )
+
+    def test_probability_contract_rejects_legacy_or_model_generated_verdict_fields(self):
+        for field, value in (("confidence", 0.9), ("confirmed", True)):
+            assessment = json.loads(self.assessment(True))
+            assessment[field] = value
+            with self.assertRaisesRegex(ValueError, "Unexpected assessment fields"):
+                pipeline._parse_json(json.dumps(assessment))
+
+    def test_probability_contract_rejects_invalid_probability_values(self):
+        for value in (-0.01, 1.01, "0.9", True):
+            assessment = json.loads(self.assessment(True))
+            assessment["vulnerability_probability"] = value
+            with self.assertRaisesRegex(ValueError, "Invalid vulnerability_probability"):
+                pipeline._parse_json(json.dumps(assessment))
 
     def test_repair_prompt_replays_strategy_alert_and_malformed_response(self):
         examples = pipeline._load_examples()
@@ -233,7 +279,7 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
             url="http://target.invalid/search?id=1%27",
         )
         repaired = json.dumps({
-            "confirmed": True, "confidence": 0.9,
+            "vulnerability_probability": 0.9,
             "vulnerability_type": "SQL Injection", "cwe_id": "CWE-89",
             "severity": "High", "rationale": "Database evidence supports SQL injection.",
             "recommended_action": "Use parameterized queries.",
@@ -245,7 +291,7 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
         def invoke(_chain, payload, **kwargs):
             calls.append((payload, kwargs["request_kind"]))
             if kwargs["request_kind"] == "primary":
-                return '{"confirmed":true,"vulnerability_type":"SQL Injection","cwe_id":'
+                return '{"vulnerability_probability":0.9,"vulnerability_type":"SQL Injection","cwe_id":'
             return repaired
 
         chain = FakeChain()
@@ -264,6 +310,8 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
         self.assertEqual(len(calls), len(pipeline.STRATEGIES) * 2)
         self.assertTrue(all(row["vulnerability_type"] == "SQL Injection" for row in records))
         self.assertTrue(all(row["cwe_id"] == "CWE-89" for row in records))
+        self.assertTrue(all(row["vulnerability_probability"] == 0.9 for row in records))
+        self.assertTrue(all(row["confirmed"] for row in records))
         self.assertTrue(all(row["repair_attempted"] for row in records))
         self.assertTrue(all(row["repaired"] for row in records))
         self.assertTrue(all(row["assessment_origin"] == "strategy_preserving_repair" for row in records))
@@ -296,6 +344,7 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
 
         self.assertEqual(len(records), len(pipeline.STRATEGIES))
         self.assertTrue(all(row["confirmed"] is None for row in records))
+        self.assertTrue(all(row["vulnerability_probability"] is None for row in records))
         self.assertTrue(all(row["assessment_origin"] == "unparsed" for row in records))
         self.assertTrue(all("repair unavailable" in row["repair_parse_error"] for row in records))
         self.assertEqual(
@@ -385,12 +434,13 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
             state = json.loads(
                 (run_dir / pipeline.TRIAGE_CHECKPOINT_STATE_FILE).read_text(encoding="utf-8")
             )
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(state["completed_assessment_count"], 1)
+            self.assertEqual(state["version"], 3)
+            self.assertEqual(manifest["probability_contract"], pipeline.PROBABILITY_CONTRACT)
             self.assertEqual(
                 state["triage_protocol_sha256"],
-                json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))[
-                    "triage_protocol_sha256"
-                ],
+                manifest["triage_protocol_sha256"],
             )
             self.assertEqual(len(checkpoint.read_text(encoding="utf-8").splitlines()), 1)
             with checkpoint.open("a", encoding="utf-8") as file:
@@ -432,6 +482,18 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                 pipeline._load_triage_checkpoint(
                     run_dir, clusters, "fixture", pipeline.MODEL, protocol_sha256,
                 )
+
+    def test_checkpoint_rejects_phase_one_version(self):
+        clusters = pipeline.deduplicate_alerts([self.alert(0)])
+        protocol_sha256 = pipeline._triage_protocol_sha256()
+        state = pipeline._checkpoint_state(
+            clusters, "fixture", pipeline.MODEL, 0, protocol_sha256,
+        )
+        state["version"] = 2
+        with self.assertRaisesRegex(ValueError, "start a new triage run"):
+            pipeline._validate_checkpoint_state(
+                state, clusters, "fixture", pipeline.MODEL, protocol_sha256,
+            )
 
     def test_scan_only_writes_scan_artifacts_without_triage(self):
         alerts = [{"app": "juice_shop", "alert_name": "Example", "url": "http://juice-shop:3000/"}]
@@ -655,6 +717,41 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
         self.assertFalse(pipeline._rule_matches(rule, {**alert, "alert_name": "SQL Injection"}))
         self.assertFalse(pipeline._rule_matches(rule, {**alert, "evidence": "different"}))
 
+    def test_unknown_target_version_binds_only_through_immutable_provenance(self):
+        rule = {
+            **self.rule(),
+            "target_version": "26.04",
+            "target_image_digest": "sha256:immutable",
+            "environment_lock_sha256": "lock-sha",
+        }
+        alert = {
+            **self.alert(0),
+            "cluster_id": "cluster",
+            "target_version": "unknown",
+            "target_image_digest": "sha256:immutable",
+            "environment_lock_sha256": "lock-sha",
+        }
+
+        self.assertTrue(pipeline._rule_matches(rule, alert))
+        self.assertEqual(
+            pipeline.build_match_audit([alert], [rule], [])[0]["version_match_basis"],
+            "immutable_provenance",
+        )
+        self.assertFalse(pipeline._rule_matches(
+            rule, {**alert, "environment_lock_sha256": "different"},
+        ))
+
+        exact = {**alert, "target_version": "26.04"}
+        self.assertEqual(
+            pipeline.build_match_audit([exact], [rule], [])[0]["version_match_basis"],
+            "exact",
+        )
+
+        conflict = {**alert, "target_version": "27.01"}
+        conflict_audit = pipeline.build_match_audit([conflict], [rule], [])[0]
+        self.assertEqual(conflict_audit["ground_truth_label"], "UNMAPPED")
+        self.assertEqual(conflict_audit["version_match_basis"], "conflict")
+
     def test_candidate_match_is_auditable_but_not_metric_label(self):
         alert = {**self.alert(0), "cluster_id": "cluster"}
         audit = pipeline.build_match_audit([alert], [], [self.rule(status="candidate")])
@@ -670,7 +767,9 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                 "alert_name": alert["alert_name"], "zap_cwe_id": "CWE-497", "url": alert["url"],
                 "evidence": alert["evidence"], "pluginid": "10096", "risk": "Low",
                 "prompt_strategy": strategy, "parsed_successfully": True,
-                "confirmed": False, "confidence": 0.2,
+                "confirmed": False, "vulnerability_probability": 0.2,
+                "probability_contract_version": pipeline.PROBABILITY_CONTRACT_VERSION,
+                "verdict_threshold": pipeline.VERDICT_THRESHOLD,
             })
         diagnostics = {"strategies": {strategy: {"parse_success_rate": 1.0} for strategy in pipeline.STRATEGIES}}
         with tempfile.TemporaryDirectory() as directory:
@@ -707,11 +806,14 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                     "zap_cwe_id": "CWE-89" if confirmed else "CWE-497",
                     "url": f"http://target.invalid/{cluster_id}", "evidence": "fixture",
                     "pluginid": "40018", "risk": "High" if confirmed else "Low",
+                    "zap_confidence": "Low" if confirmed else "High",
                     "prompt_strategy": strategy, "parsed_successfully": True,
                     "initial_parsed_successfully": origin == "initial",
                     "repair_attempted": origin != "initial", "repaired": origin != "initial",
                     "assessment_origin": origin, "confirmed": confirmed,
-                    "confidence": 0.9 if confirmed else 0.1,
+                    "vulnerability_probability": 0.9 if confirmed else 0.1,
+                    "probability_contract_version": pipeline.PROBABILITY_CONTRACT_VERSION,
+                    "verdict_threshold": pipeline.VERDICT_THRESHOLD,
                 })
         audit = [
             {
@@ -747,11 +849,66 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                 row["prompt_strategy"]: row for row in sensitivity["metrics"]
             }
             self.assertTrue(all(row["sample_count"] == 3 for row in operational.values()))
+            self.assertTrue(all(abs(row["brier_score"] - 0.01) < 1e-12 for row in operational.values()))
             self.assertTrue(all(row["sample_count"] == 2 for row in sensitivity_metrics.values()))
             self.assertEqual(sensitivity["eligible_cluster_count"], 2)
             self.assertEqual(sensitivity["excluded_cluster_count"], 1)
             self.assertEqual(sensitivity["repaired_cluster_count_by_strategy"]["zero_shot"], 1)
+            self.assertEqual(summary["probability_contract"]["operational_calibration_status"], "available")
+            self.assertEqual(sensitivity["calibration_status"], "available")
             self.assertTrue((run_dir / "initial_only_evaluation_results.csv").is_file())
+
+    def test_legacy_confidence_is_readable_but_excluded_from_calibration(self):
+        cluster_specs = [("positive", "0", True), ("negative", "1", False)]
+        records = []
+        for strategy in pipeline.STRATEGIES:
+            for cluster_id, alert_id, confirmed in cluster_specs:
+                records.append({
+                    "alert_id": alert_id, "cluster_id": cluster_id, "app": "juice_shop",
+                    "alert_name": "SQL Injection" if confirmed else "Timestamp Disclosure - Unix",
+                    "zap_cwe_id": "CWE-89" if confirmed else "CWE-497",
+                    "url": f"http://target.invalid/{cluster_id}", "evidence": "fixture",
+                    "pluginid": "40018", "risk": "High" if confirmed else "Low",
+                    "prompt_strategy": strategy, "parsed_successfully": True,
+                    "assessment_origin": "initial", "confirmed": confirmed,
+                    "confidence": 0.99 if confirmed else 0.01,
+                })
+        audit = [
+            {
+                "alert_id": alert_id, "cluster_id": cluster_id, "app": "juice_shop",
+                "alert_name": "SQL Injection" if confirmed else "Timestamp Disclosure - Unix",
+                "zap_cwe_id": "CWE-89" if confirmed else "CWE-497",
+                "ground_truth_label": "VULNERABLE" if confirmed else "NOT_VULNERABLE",
+                "matched_rule_id": f"rule_{cluster_id}", "rule_status": "validated",
+                "provider_key": "provider" if confirmed else "", "rationale": "fixture",
+                "validation_basis": "fixture", "source_ref": "fixture",
+            }
+            for cluster_id, alert_id, confirmed in cluster_specs
+        ]
+        diagnostics = {"strategies": {
+            strategy: {"parse_success_rate": 1.0, "initial_parse_success_rate": 1.0}
+            for strategy in pipeline.STRATEGIES
+        }}
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            with (
+                patch.object(pipeline, "load_automated_rules", return_value=([], [])),
+                patch.object(pipeline, "build_match_audit", return_value=audit),
+                patch.object(pipeline, "write_validation_coverage_artifacts", return_value={}),
+            ):
+                summary = pipeline.evaluate_post_triage(run_dir, records, diagnostics)
+            triage = pipeline.pd.read_csv(run_dir / "triage_results.csv")
+            calibration = (run_dir / "calibration_results.csv").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            summary["probability_contract"]["operational_calibration_status"],
+            "unavailable_legacy_undefined_confidence",
+        )
+        self.assertTrue(all(row["brier_score"] is None for row in summary["metrics"]))
+        self.assertTrue(all(row["ece"] is None for row in summary["metrics"]))
+        self.assertTrue(triage["llm_vulnerability_probability"].isna().all())
+        self.assertEqual(set(triage["legacy_llm_confidence"]), {0.99, 0.01})
+        self.assertEqual(calibration, "\n")
 
     def test_parse_failure_never_becomes_safe_prediction(self):
         clusters = pipeline.deduplicate_alerts([self.alert(0)])
@@ -764,6 +921,7 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
         ):
             records, diagnostics = pipeline.triage_clusters(clusters, "fixture")
         self.assertTrue(all(row["confirmed"] is None for row in records))
+        self.assertTrue(all(row["vulnerability_probability"] is None for row in records))
         self.assertTrue(all(row["assessment_origin"] == "unparsed" for row in records))
         self.assertTrue(all(row["repair_attempted"] for row in records))
         self.assertTrue(all(not row["repaired"] for row in records))

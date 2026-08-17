@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import friedmanchisquare, wilcoxon
 from sklearn.metrics import (
+    accuracy_score,
     brier_score_loss,
     classification_report,
     cohen_kappa_score,
@@ -40,11 +41,13 @@ from urllib3.exceptions import ProtocolError
 
 from environment_lock import DEFAULT_LOCK_PATH, capture_environment_lock, verify_environment_lock
 from evaluator import (
+    ACCEPTED_VERSION_MATCH_BASES,
     RULE_PROVENANCE_COLUMNS,
     load_detection_validation,
     load_ground_truth,
     normalize_cwe_id,
     normalize_text,
+    target_version_match_basis,
 )
 from zap_scanner import (
     build_vulnerable_app_benchmark_payload,
@@ -81,18 +84,55 @@ GROUND_TRUTH_PATH = LAB_DIR / "ground_truth.csv"
 RULES_PATH = LAB_DIR / "ground_truth_match_rules.csv"
 VALIDATION_PATH = LAB_DIR / "ground_truth_detection_validation.csv"
 EXAMPLES_PATH = LAB_DIR / "few_shot_examples.json"
+SEMANTIC_TAXONOMY_PATH = LAB_DIR / "semantic_taxonomy.json"
 GROUND_TRUTH_CANDIDATE_COLUMNS = (
     "zap_alert_name", "zap_cwe_id", "app", "route_pattern", "evidence_pattern",
     "status", "provider_key", "request_method", "plugin_id", "evidence_source",
 )
 TRIAGE_RESULT_COLUMNS = (
     "zap_alert_name", "app", "url", "cwe", "strategy", "llm_verdict",
-    "llm_confidence", "assessment_origin", "repair_attempted", "repaired",
+    "llm_vulnerability_probability", "probability_contract_version",
+    "verdict_threshold", "legacy_llm_confidence", "assessment_origin",
+    "repair_attempted", "repaired",
+    "raw_model_family", "canonical_model_family", "raw_model_cwe",
+    "canonical_model_cwe", "expected_vulnerability_family",
+    "compatible_llm_cwe_ids", "family_compatible", "cwe_compatible",
+    "semantic_ground_truth_label", "semantic_predicted_label",
+    "semantic_correct", "semantic_error_reason",
     "ground_truth_label", "matched_rule", "duplicate_count",
 )
-TRIAGE_CHECKPOINT_VERSION = 2
+TRIAGE_CHECKPOINT_VERSION = 3
 TRIAGE_CHECKPOINT_FILE = "triage_checkpoint.jsonl"
 TRIAGE_CHECKPOINT_STATE_FILE = "triage_checkpoint_state.json"
+
+PROBABILITY_CONTRACT_VERSION = "vulnerability-probability-v1"
+VERDICT_THRESHOLD = 0.5
+PROBABILITY_EVENT = (
+    "the supplied alert represents a real, exploitable vulnerability in the target"
+)
+PROBABILITY_CONTRACT = {
+    "version": PROBABILITY_CONTRACT_VERSION,
+    "field": "vulnerability_probability",
+    "event": PROBABILITY_EVENT,
+    "conditioning": "only the supplied alert fields",
+    "derived_verdict": f"confirmed = vulnerability_probability >= {VERDICT_THRESHOLD}",
+    "threshold": VERDICT_THRESHOLD,
+}
+EVALUATION_PROTOCOL_VERSION = "semantic-v1"
+SEMANTIC_SCORING_POLICY = {
+    "prediction": "confirmed=false=>SAFE; confirmed=true=>canonical_family|normalized_CWE",
+    "positive_correctness": "verdict and exact family alias and compatible CWE",
+    "negative_correctness": "only confirmed=false is SAFE",
+    "unknown_family": "UNRECOGNIZED",
+    "invalid_cwe": "INVALID_CWE",
+}
+PROVENANCE_MATCHING_POLICY = {
+    "explicit_target_version": "exact_match_required",
+    "unknown_target_version": (
+        "accepted_only_when_rule_image_digest_and_environment_lock_sha256_are_present_and_match_exactly"
+    ),
+    "explicit_target_version_conflict": "reject",
+}
 
 CVSS_CHOICES = {
     "av": {"N", "A", "L", "P"},
@@ -104,8 +144,7 @@ CVSS_CHOICES = {
 ASSESSMENT_SCHEMA = {
     "type": "object",
     "properties": {
-        "confirmed": {"type": "boolean"},
-        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "vulnerability_probability": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "vulnerability_type": {"type": "string"},
         "cwe_id": {"type": "string"},
         "severity": {"type": "string"},
@@ -118,7 +157,7 @@ ASSESSMENT_SCHEMA = {
         "cvss_s": {"type": "string", "enum": sorted(CVSS_CHOICES["s"])},
     },
     "required": [
-        "confirmed", "confidence", "vulnerability_type", "cwe_id", "severity",
+        "vulnerability_probability", "vulnerability_type", "cwe_id", "severity",
         "rationale", "recommended_action", "cvss_av", "cvss_ac", "cvss_pr",
         "cvss_ui", "cvss_s",
     ],
@@ -129,9 +168,13 @@ RESPONSE_FORMAT = {
     "json_schema": {"name": "dast_triage_assessment", "schema": ASSESSMENT_SCHEMA, "strict": True},
 }
 BASE_INSTRUCTION = (
+    f"Set vulnerability_probability to P({PROBABILITY_EVENT} | only the supplied alert fields). "
+    "It is not confidence in your explanation, vulnerability type, CWE, severity, or in ZAP itself. "
+    "Do not use ground truth, study-target knowledge, or evidence that was not supplied in this alert. "
     "Return exactly one JSON object with the required fields. Do not include Markdown or prose. "
     "Always provide CVSS v3.1 AV, AC, PR, UI, and Scope metrics for the finding, even when "
-    "you classify it as not confirmed."
+    f"vulnerability_probability is below {VERDICT_THRESHOLD}. The pipeline derives the Boolean "
+    "confirmed verdict; do not return a confirmed or confidence field."
 )
 STRATEGY_INSTRUCTIONS = {
     "zero_shot": "Assess the ZAP alert directly using the supplied evidence.",
@@ -141,7 +184,7 @@ STRATEGY_INSTRUCTIONS = {
 REPAIR_INSTRUCTION = (
     "The response above failed strict parsing with this error: {parse_error}\n"
     "Repair the response while preserving every recoverable substantive assessment value. "
-    "Do not replace a recoverable vulnerability type, CWE, verdict, confidence, severity, rationale, "
+    "Do not replace a recoverable vulnerability probability, vulnerability type, CWE, severity, rationale, "
     "recommended action, or CVSS value with a different assessment. If the response ended before all "
     "required fields were emitted, complete only the missing or invalid fields from the same supplied "
     "alert using the same strategy. Return exactly one schema-valid JSON object with no Markdown or prose."
@@ -566,16 +609,32 @@ def _parse_json(raw: str) -> dict:
         value = json.loads(match.group(0))
     if not isinstance(value, dict):
         raise ValueError("Assessment must be a JSON object")
+    unexpected = set(value).difference(ASSESSMENT_SCHEMA["properties"])
+    if unexpected:
+        raise ValueError(f"Unexpected assessment fields: {sorted(unexpected)}")
     for field in ASSESSMENT_SCHEMA["required"]:
         if field not in value:
             raise ValueError(f"Missing assessment field: {field}")
-    if not isinstance(value["confirmed"], bool) or not 0 <= float(value["confidence"]) <= 1:
-        raise ValueError("Invalid confirmed or confidence value")
+    probability = value["vulnerability_probability"]
+    if (
+        isinstance(probability, bool)
+        or not isinstance(probability, (int, float))
+        or not np.isfinite(probability)
+        or not 0 <= probability <= 1
+    ):
+        raise ValueError("Invalid vulnerability_probability; expected a finite number from 0 to 1")
+    value["vulnerability_probability"] = float(probability)
+    for field in ASSESSMENT_SCHEMA["properties"]:
+        if field != "vulnerability_probability" and not isinstance(value[field], str):
+            raise ValueError(f"Invalid assessment field type for {field}; expected string")
     for field, choices in CVSS_CHOICES.items():
         key = f"cvss_{field}"
         if str(value[key]).upper() not in choices:
             raise ValueError(f"Invalid CVSS value for {key}")
         value[key] = str(value[key]).upper()
+    value["confirmed"] = value["vulnerability_probability"] >= VERDICT_THRESHOLD
+    value["verdict_threshold"] = VERDICT_THRESHOLD
+    value["probability_contract_version"] = PROBABILITY_CONTRACT_VERSION
     return value
 
 
@@ -591,16 +650,33 @@ def _load_examples(path: Path = EXAMPLES_PATH) -> str:
     rows = _load_json(path)
     if not isinstance(rows, list) or len(rows) != 4:
         raise ValueError("few_shot_examples.json must contain exactly four examples")
-    labels = [row.get("confirmed") for row in rows]
-    if labels.count(True) != 2 or labels.count(False) != 2:
-        raise ValueError("few_shot_examples.json must contain two confirmed and two false examples")
+    labels = []
     target_tokens = {"juice shop", "juice_shop", "vulnerableapp", "vulnerable app", "vulnerable_app"}
     for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Every few-shot example must be a JSON object")
+        if "confidence" in row or "confirmed" in row:
+            raise ValueError("Few-shot examples must use vulnerability_probability without confidence or confirmed")
+        assessment = {
+            field: row[field]
+            for field in ASSESSMENT_SCHEMA["required"]
+            if field in row
+        }
+        if len(assessment) != len(ASSESSMENT_SCHEMA["required"]):
+            missing = sorted(set(ASSESSMENT_SCHEMA["required"]).difference(row))
+            raise ValueError(f"Few-shot example is missing assessment fields: {missing}")
+        parsed = _parse_json(json.dumps(assessment, ensure_ascii=False))
+        labels.append(parsed["confirmed"])
         if not str(row.get("source_url", "")).strip():
             raise ValueError("Every few-shot example must include a source_url")
         text = json.dumps(row).lower()
         if any(token in text for token in target_tokens):
             raise ValueError("Few-shot examples must not identify a study application")
+    if labels.count(True) != 2 or labels.count(False) != 2:
+        raise ValueError(
+            "few_shot_examples.json must contain two probabilities at or above the verdict "
+            "threshold and two below it"
+        )
     return json.dumps(rows, ensure_ascii=False)
 
 
@@ -622,6 +698,7 @@ def _triage_protocol_sha256(examples_metadata: dict | None = None) -> str:
         "strategy_instructions": STRATEGY_INSTRUCTIONS,
         "base_instruction": BASE_INSTRUCTION,
         "repair_instruction": REPAIR_INSTRUCTION,
+        "probability_contract": PROBABILITY_CONTRACT,
         "assessment_schema": ASSESSMENT_SCHEMA,
         "few_shot_examples_sha256": metadata["sha256"],
     }
@@ -900,6 +977,7 @@ def triage_clusters(
             "run_id": run_id,
             "model": model,
             "triage_protocol_sha256": protocol_sha256,
+            "probability_contract": PROBABILITY_CONTRACT,
             "resumed_assessment_count": len(checkpoint_records),
         },
         "strategies": {},
@@ -998,7 +1076,13 @@ def triage_clusters(
                 "parsed_successfully": assessment is not None, "inference_latency_seconds": latency,
             }
             if assessment is None:
-                output.update({"confirmed": None, "confidence": None, "cvss_exploitability": None})
+                output.update({
+                    "confirmed": None,
+                    "vulnerability_probability": None,
+                    "verdict_threshold": VERDICT_THRESHOLD,
+                    "probability_contract_version": PROBABILITY_CONTRACT_VERSION,
+                    "cvss_exploitability": None,
+                })
             else:
                 output.update(assessment)
                 output["cvss_exploitability"] = cvss31_exploitability(assessment)
@@ -1075,6 +1159,111 @@ def _evidence_bundle(alert: dict) -> str:
     return "\n".join(str(alert.get(field, "")) for field in ("evidence", "attack", "description"))
 
 
+def load_semantic_taxonomy(path: Path = SEMANTIC_TAXONOMY_PATH) -> dict:
+    data = _load_json(path)
+    if not isinstance(data.get("version"), str) or not data["version"].strip():
+        raise ValueError("Semantic taxonomy requires a version")
+    families = data.get("families")
+    if not isinstance(families, dict) or not families:
+        raise ValueError("Semantic taxonomy requires canonical families")
+    aliases: dict[str, str] = {}
+    for family, definition in families.items():
+        canonical = normalize_text(family).replace(" ", "_")
+        if canonical != family or not re.fullmatch(r"[a-z][a-z0-9_]*", family):
+            raise ValueError(f"Invalid canonical vulnerability family: {family}")
+        values = [family.replace("_", " "), *(definition.get("aliases") or [])]
+        for value in values:
+            alias = normalize_text(value)
+            if not alias:
+                raise ValueError(f"Blank alias in semantic family {family}")
+            if alias in aliases:
+                raise ValueError(
+                    f"Duplicate semantic alias {alias!r} in {family} and {aliases[alias]}"
+                )
+            aliases[alias] = family
+    return {"version": data["version"], "families": families, "aliases": aliases}
+
+
+def _strict_cwe(value) -> str:
+    normalized = normalize_cwe_id(value)
+    return normalized if re.fullmatch(r"CWE-[1-9][0-9]*", normalized) else ""
+
+
+def _compatible_cwes(value: str) -> tuple[str, ...]:
+    raw = [item.strip() for item in str(value or "").split("|") if item.strip()]
+    normalized = tuple(_strict_cwe(item) for item in raw)
+    if not raw or any(not item for item in normalized) or len(set(normalized)) != len(normalized):
+        raise ValueError(f"Invalid or duplicate compatible_llm_cwe_ids: {value!r}")
+    return normalized
+
+
+def _semantic_assessment(record: dict, match: dict, taxonomy: dict) -> dict:
+    confirmed = record.get("confirmed")
+    raw_family = str(record.get("vulnerability_type", "")).strip()
+    raw_cwe = str(record.get("cwe_id", "")).strip()
+    canonical_family = taxonomy["aliases"].get(normalize_text(raw_family), "UNRECOGNIZED")
+    canonical_cwe = _strict_cwe(raw_cwe) or "INVALID_CWE"
+    expected_family = match.get("expected_vulnerability_family", "")
+    expected_cwes = tuple(match.get("compatible_llm_cwe_ids", ()))
+    truth = "SAFE" if match["ground_truth_label"] == "NOT_VULNERABLE" else (
+        f"{expected_family}|{expected_cwes[0]}" if expected_family and expected_cwes
+        else "UNRESOLVED_GROUND_TRUTH"
+    )
+    predicted = "SAFE" if confirmed is False else f"{canonical_family}|{canonical_cwe}"
+    family_ok = bool(expected_family and canonical_family == expected_family)
+    cwe_ok = bool(expected_cwes and canonical_cwe in expected_cwes)
+    if match["ground_truth_label"] == "NOT_VULNERABLE":
+        correct = confirmed is False
+        reason = "correct_safe" if correct else "false_positive"
+    elif confirmed is not True:
+        correct, reason = False, "false_negative_verdict"
+    elif canonical_family == "UNRECOGNIZED":
+        correct, reason = False, "unrecognized_family"
+    elif canonical_cwe == "INVALID_CWE":
+        correct, reason = False, "invalid_cwe"
+    elif family_ok and cwe_ok:
+        correct, reason = True, "correct_semantic_positive"
+        predicted = f"{expected_family}|{expected_cwes[0]}"
+        truth = predicted
+    elif not family_ok and not cwe_ok:
+        correct, reason = False, "family_and_cwe_mismatch"
+    elif not family_ok:
+        correct, reason = False, "family_mismatch"
+    else:
+        correct, reason = False, "cwe_mismatch"
+    return {
+        "raw_model_family": raw_family,
+        "canonical_model_family": canonical_family,
+        "raw_model_cwe": raw_cwe,
+        "canonical_model_cwe": canonical_cwe,
+        "expected_vulnerability_family": expected_family,
+        "compatible_llm_cwe_ids": "|".join(expected_cwes),
+        "family_compatible": family_ok,
+        "cwe_compatible": cwe_ok,
+        "semantic_ground_truth_label": truth,
+        "semantic_predicted_label": predicted,
+        "semantic_correct": correct,
+        "semantic_error_reason": reason,
+    }
+
+
+def _evaluation_protocol(taxonomy_path=SEMANTIC_TAXONOMY_PATH, rules_path=RULES_PATH,
+                         validation_path=VALIDATION_PATH) -> dict:
+    taxonomy = load_semantic_taxonomy(taxonomy_path)
+    components = {
+        "version": EVALUATION_PROTOCOL_VERSION,
+        "scoring_policy": SEMANTIC_SCORING_POLICY,
+        "taxonomy_sha256": hashlib.sha256(Path(taxonomy_path).read_bytes()).hexdigest(),
+        "match_rules_sha256": hashlib.sha256(Path(rules_path).read_bytes()).hexdigest(),
+        "validation_overlay_sha256": hashlib.sha256(Path(validation_path).read_bytes()).hexdigest(),
+        "taxonomy_version": taxonomy["version"],
+        "semantic_rule_fields": ["expected_vulnerability_family", "compatible_llm_cwe_ids"],
+        "provenance_matching_policy": PROVENANCE_MATCHING_POLICY,
+    }
+    encoded = json.dumps(components, sort_keys=True, separators=(",", ":")).encode()
+    return {**components, "fingerprint_sha256": hashlib.sha256(encoded).hexdigest()}
+
+
 def load_automated_rules(
     rules_path: Path = RULES_PATH,
     ground_truth_path: Path = GROUND_TRUTH_PATH,
@@ -1087,6 +1276,7 @@ def load_automated_rules(
     required = {
         "rule_id", "rule_status", "app", "zap_alert_name", "zap_cwe_id", "url_regex",
         "evidence_regex", "negative_evidence_regex", "ground_truth_label", "provider_key", "rationale",
+        "expected_vulnerability_family", "compatible_llm_cwe_ids",
     }
     rules_df = pd.read_csv(rules_path, dtype=str).fillna("")
     missing = required.difference(rules_df.columns)
@@ -1097,12 +1287,15 @@ def load_automated_rules(
             rules_df[column] = ""
     if rules_df["rule_id"].str.strip().duplicated().any():
         raise ValueError("Ground-truth rule IDs must be unique")
+    taxonomy = load_semantic_taxonomy()
     validated, provisional = [], []
     for _, row in rules_df.iterrows():
         rule_id = row["rule_id"].strip()
         status = row["rule_status"].strip().lower()
         label = row["ground_truth_label"].strip().upper()
         provider_key = row["provider_key"].strip()
+        expected_family = ""
+        compatible_cwes: tuple[str, ...] = ()
         if not rule_id or status not in {"validated", "candidate", "supporting_only"}:
             raise ValueError(f"Rule {rule_id or '<blank>'} has invalid rule_status")
         if label not in {"VULNERABLE", "NOT_VULNERABLE"}:
@@ -1112,6 +1305,10 @@ def load_automated_rules(
         if provider_key and provider_key not in known_providers:
             raise ValueError(f"Rule {rule_id} references unknown provider_key {provider_key}")
         if label == "VULNERABLE":
+            expected_family = row["expected_vulnerability_family"].strip()
+            if expected_family not in taxonomy["families"]:
+                raise ValueError(f"Vulnerable rule {rule_id} has unknown canonical family {expected_family!r}")
+            compatible_cwes = _compatible_cwes(row["compatible_llm_cwe_ids"])
             if not provider_key:
                 raise ValueError(f"Vulnerable rule {rule_id} must define provider_key")
             matching_validation = validation[
@@ -1147,10 +1344,17 @@ def load_automated_rules(
                 "environment_lock_sha256": row["environment_lock_sha256"].strip(),
                 "validation_basis": row["validation_basis"].strip().lower(),
                 "source_ref": row["source_ref"].strip(),
+                "expected_vulnerability_family": expected_family if label == "VULNERABLE" else "",
+                "compatible_llm_cwe_ids": compatible_cwes if label == "VULNERABLE" else (),
                 "ground_truth_label": label, "provider_key": provider_key, "rationale": row["rationale"].strip(),
             }
         except re.error as error:
             raise ValueError(f"Rule {rule_id} contains an invalid regex: {error}") from error
+        if label == "NOT_VULNERABLE" and (
+            row["expected_vulnerability_family"].strip()
+            or row["compatible_llm_cwe_ids"].strip()
+        ):
+            raise ValueError(f"Not-vulnerable rule {rule_id} must leave semantic fields blank")
         juice_provenance_missing = (
             label == "VULNERABLE"
             and rule["app"] == "juice_shop"
@@ -1169,7 +1373,10 @@ def load_automated_rules(
         else:
             (validated if status == "validated" else provisional).append(rule)
 
+    represented_providers = {rule["provider_key"] for rule in provisional if rule.get("provider_key")}
     for _, row in validation[validation["validation_status"].isin({"candidate", "supporting_only"})].iterrows():
+        if row["provider_key"] in represented_providers:
+            continue
         if not all(str(row[field]).strip() for field in ("zap_alert_name", "zap_cwe_id", "url_regex")):
             continue
         try:
@@ -1189,6 +1396,8 @@ def load_automated_rules(
                 "environment_lock_sha256": str(row["environment_lock_sha256"]).strip(),
                 "validation_basis": str(row["validation_basis"]).strip().lower(),
                 "source_ref": str(row["source_ref"]).strip(),
+                "expected_vulnerability_family": "",
+                "compatible_llm_cwe_ids": (),
                 "provider_key": row["provider_key"], "rationale": row["rationale"],
             })
         except re.error as error:
@@ -1217,10 +1426,23 @@ def _rule_matches(rule: dict, alert: dict) -> bool:
     authentication = str(alert.get("authentication_context", "")).strip().lower()
     if (rule.get("authentication_context") or "") not in {"", "any", authentication}:
         return False
-    for field in ("target_version", "target_image_digest", "environment_lock_sha256"):
+    for field in ("target_image_digest", "environment_lock_sha256"):
         if rule.get(field) and rule[field] != str(alert.get(field, "")).strip():
             return False
+    if target_version_match_basis(rule, alert) not in ACCEPTED_VERSION_MATCH_BASES:
+        return False
     return not (rule["negative_evidence_pattern"] and rule["negative_evidence_pattern"].search(evidence))
+
+
+def _unmatched_version_basis(alert: dict, rules: list[dict]) -> str:
+    """Expose an otherwise matching rule rejected by an explicit version conflict."""
+    for rule in rules:
+        if target_version_match_basis(rule, alert) != "conflict":
+            continue
+        rule_without_version = {**rule, "target_version": ""}
+        if _rule_matches(rule_without_version, alert):
+            return "conflict"
+    return ""
 
 
 def build_match_audit(alerts: list[dict], validated_rules: list[dict], provisional_rules: list[dict]) -> list[dict]:
@@ -1234,11 +1456,11 @@ def build_match_audit(alerts: list[dict], validated_rules: list[dict], provision
         family = f"{alert.get('app', '')}|{alert.get('alert_name', '')}|{alert.get('zap_cwe_id', '')}"
         if matches:
             rule = matches[0]
-            match = {"ground_truth_label": rule["ground_truth_label"], "ground_truth": rule["ground_truth_label"] == "VULNERABLE", "matched_rule_id": rule["rule_id"], "rule_status": rule["rule_status"], "provider_key": rule["provider_key"], "rationale": rule["rationale"], "validation_basis": rule.get("validation_basis", ""), "source_ref": rule.get("source_ref", ""), "provisional_rule_ids": ""}
+            match = {"ground_truth_label": rule["ground_truth_label"], "ground_truth": rule["ground_truth_label"] == "VULNERABLE", "matched_rule_id": rule["rule_id"], "rule_status": rule["rule_status"], "provider_key": rule["provider_key"], "rationale": rule["rationale"], "validation_basis": rule.get("validation_basis", ""), "source_ref": rule.get("source_ref", ""), "version_match_basis": target_version_match_basis(rule, alert), "expected_vulnerability_family": rule.get("expected_vulnerability_family", ""), "compatible_llm_cwe_ids": rule.get("compatible_llm_cwe_ids", ()), "provisional_rule_ids": ""}
         elif provisional_matches:
-            match = {"ground_truth_label": "PROVISIONAL", "ground_truth": None, "matched_rule_id": "", "rule_status": "provisional", "provider_key": "|".join(rule["provider_key"] for rule in provisional_matches), "rationale": " | ".join(rule["rationale"] for rule in provisional_matches), "validation_basis": "|".join(sorted({rule.get("validation_basis", "") for rule in provisional_matches if rule.get("validation_basis")})), "source_ref": "|".join(sorted({rule.get("source_ref", "") for rule in provisional_matches if rule.get("source_ref")})), "provisional_rule_ids": "|".join(rule["rule_id"] for rule in provisional_matches)}
+            match = {"ground_truth_label": "PROVISIONAL", "ground_truth": None, "matched_rule_id": "", "rule_status": "provisional", "provider_key": "|".join(rule["provider_key"] for rule in provisional_matches), "rationale": " | ".join(rule["rationale"] for rule in provisional_matches), "validation_basis": "|".join(sorted({rule.get("validation_basis", "") for rule in provisional_matches if rule.get("validation_basis")})), "source_ref": "|".join(sorted({rule.get("source_ref", "") for rule in provisional_matches if rule.get("source_ref")})), "version_match_basis": "|".join(sorted({target_version_match_basis(rule, alert) for rule in provisional_matches})), "expected_vulnerability_family": "", "compatible_llm_cwe_ids": (), "provisional_rule_ids": "|".join(rule["rule_id"] for rule in provisional_matches)}
         else:
-            match = {"ground_truth_label": "UNMAPPED", "ground_truth": None, "matched_rule_id": "", "rule_status": "", "provider_key": "", "rationale": "No validated or provisional ground-truth rule matched this alert.", "validation_basis": "", "source_ref": "", "provisional_rule_ids": ""}
+            match = {"ground_truth_label": "UNMAPPED", "ground_truth": None, "matched_rule_id": "", "rule_status": "", "provider_key": "", "rationale": "No validated or provisional ground-truth rule matched this alert.", "validation_basis": "", "source_ref": "", "version_match_basis": _unmatched_version_basis(alert, validated_rules + provisional_rules), "expected_vulnerability_family": "", "compatible_llm_cwe_ids": (), "provisional_rule_ids": ""}
         audit.append({
             "alert_id": alert["alert_id"], "cluster_id": alert["cluster_id"], "app": alert.get("app", ""),
             "alert_name": alert.get("alert_name", ""), "zap_cwe_id": alert.get("zap_cwe_id", ""),
@@ -1255,13 +1477,13 @@ def build_match_audit(alerts: list[dict], validated_rules: list[dict], provision
     return audit
 
 
-def _ece(y_true, confidence, bins=10):
-    y_true, confidence = np.asarray(y_true, dtype=float), np.asarray(confidence, dtype=float)
+def _ece(y_true, probability, bins=10):
+    y_true, probability = np.asarray(y_true, dtype=float), np.asarray(probability, dtype=float)
     edges, rows = np.linspace(0.0, 1.0, bins + 1), []
     for index in range(bins):
-        mask = (confidence >= edges[index]) & ((confidence < edges[index + 1]) if index < bins - 1 else (confidence <= edges[index + 1]))
+        mask = (probability >= edges[index]) & ((probability < edges[index + 1]) if index < bins - 1 else (probability <= edges[index + 1]))
         if mask.any():
-            rows.append({"bin": index, "count": int(mask.sum()), "mean_confidence": float(confidence[mask].mean()), "observed_rate": float(y_true[mask].mean()), "absolute_gap": float(abs(confidence[mask].mean() - y_true[mask].mean()))})
+            rows.append({"bin": index, "count": int(mask.sum()), "mean_vulnerability_probability": float(probability[mask].mean()), "observed_rate": float(y_true[mask].mean()), "absolute_gap": float(abs(probability[mask].mean() - y_true[mask].mean()))})
     return (float(sum(row["absolute_gap"] * row["count"] for row in rows) / len(y_true)) if len(y_true) else 0.0), rows
 
 
@@ -1375,6 +1597,38 @@ def _cluster_records(by_strategy: dict[str, dict[str, dict]]) -> dict[str, dict[
     return clustered
 
 
+def _record_vulnerability_probability(record: dict) -> float | None:
+    if record.get("probability_contract_version") != PROBABILITY_CONTRACT_VERSION:
+        return None
+    value = record.get("vulnerability_probability")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not np.isfinite(value)
+        or not 0 <= value <= 1
+    ):
+        return None
+    return float(value)
+
+
+def _calibration_contract_status(
+    population_clusters: set[str],
+    records_by_cluster: dict[str, dict[str, dict]],
+) -> str:
+    if not population_clusters:
+        return "unavailable_no_eligible_clusters"
+    records = [
+        records_by_cluster[strategy][cluster_id]
+        for strategy in STRATEGIES
+        for cluster_id in population_clusters
+    ]
+    if all(_record_vulnerability_probability(record) is not None for record in records):
+        return "available"
+    if all("vulnerability_probability" not in record for record in records):
+        return "unavailable_legacy_undefined_confidence"
+    return "unavailable_missing_or_mixed_probability_contract"
+
+
 def _evaluate_cluster_population(
     apps: set[str],
     population_clusters: set[str],
@@ -1382,9 +1636,11 @@ def _evaluate_cluster_population(
     cluster_apps: dict[str, str],
     records_by_cluster: dict[str, dict[str, dict]],
     parse_rates: dict[str, float],
-) -> tuple[dict, list[dict], list[dict], list[dict]]:
+    semantic_by_cluster: dict[str, dict[str, dict]],
+) -> tuple[dict, list[dict], list[dict], list[dict], list[dict], list[dict]]:
     app_status = {}
     metrics_rows, calibration_rows, stats_rows = [], [], []
+    boolean_metrics_rows, boolean_stats_rows = [], []
     for app in sorted(apps):
         app_clusters = {
             cluster_id
@@ -1400,7 +1656,7 @@ def _evaluate_cluster_population(
             app_status[app] = "insufficient_validated_negatives"
             continue
         app_status[app] = "complete"
-        correctness = {}
+        correctness, boolean_correctness = {}, {}
         for strategy in STRATEGIES:
             rows = []
             for cluster_id in sorted(app_clusters):
@@ -1409,13 +1665,30 @@ def _evaluate_cluster_population(
                     (
                         cluster_labels[cluster_id],
                         bool(record["confirmed"]),
-                        float(record["confidence"]),
+                        _record_vulnerability_probability(record),
                     )
                 )
             y_true = np.array([row[0] for row in rows], dtype=int)
             y_pred = np.array([row[1] for row in rows], dtype=int)
-            confidence = np.array([row[2] for row in rows], dtype=float)
-            ece, bins = _ece(y_true, confidence)
+            semantic_rows = [semantic_by_cluster[strategy][cluster_id] for cluster_id in sorted(app_clusters)]
+            semantic_true = [row["semantic_ground_truth_label"] for row in semantic_rows]
+            semantic_pred = [row["semantic_predicted_label"] for row in semantic_rows]
+            semantic_correct = [int(row["semantic_correct"]) for row in semantic_rows]
+            probabilities = [row[2] for row in rows]
+            probability_available = all(value is not None for value in probabilities)
+            if probability_available:
+                probability = np.array(probabilities, dtype=float)
+                ece, bins = _ece(y_true, probability)
+                brier = brier_score_loss(y_true, probability)
+                signed_gap = float((probability - y_true).mean())
+                calibration_status = "available"
+            else:
+                ece, bins, brier, signed_gap = None, [], None, None
+                calibration_status = (
+                    "unavailable_legacy_undefined_confidence"
+                    if all("vulnerability_probability" not in records_by_cluster[strategy][cluster_id] for cluster_id in app_clusters)
+                    else "unavailable_missing_or_mixed_probability_contract"
+                )
             report = classification_report(
                 y_true,
                 y_pred,
@@ -1424,15 +1697,19 @@ def _evaluate_cluster_population(
                 output_dict=True,
                 zero_division=0,
             )
-            metrics_rows.append({
+            boolean_metrics_rows.append({
                 "app": app, "prompt_strategy": strategy,
                 "precision": precision_score(y_true, y_pred, zero_division=0),
                 "recall": recall_score(y_true, y_pred, zero_division=0),
                 "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
                 "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
                 "kappa": cohen_kappa_score(y_true, y_pred),
-                "brier_score": brier_score_loss(y_true, confidence), "ece": ece,
-                "signed_calibration_gap": float((confidence - y_true).mean()),
+                "brier_score": brier, "ece": ece,
+                "signed_calibration_gap": signed_gap,
+                "calibration_status": calibration_status,
+                "probability_contract_version": (
+                    PROBABILITY_CONTRACT_VERSION if probability_available else ""
+                ),
                 "sample_count": len(rows), "positive_count": int(y_true.sum()),
                 "negative_count": int((y_true == 0).sum()),
                 "parse_success_rate": parse_rates[strategy],
@@ -1447,11 +1724,51 @@ def _evaluate_cluster_population(
                     label: report[label] for label in ("SAFE", "VULNERABLE")
                 }),
             })
+            semantic_labels = sorted(set(semantic_true) | set(semantic_pred))
+            semantic_report = classification_report(
+                semantic_true, semantic_pred, labels=semantic_labels,
+                output_dict=True, zero_division=0,
+            )
+            positive_mask = np.array(y_true, dtype=bool)
+            metrics_rows.append({
+                "evaluation_contract": EVALUATION_PROTOCOL_VERSION,
+                "app": app, "prompt_strategy": strategy,
+                "semantic_exact_match_accuracy": accuracy_score(semantic_true, semantic_pred),
+                "semantic_macro_f1": f1_score(
+                    semantic_true, semantic_pred, labels=semantic_labels,
+                    average="macro", zero_division=0,
+                ),
+                "validated_positive_semantic_recall": (
+                    float(np.array(semantic_correct)[positive_mask].mean())
+                    if positive_mask.any() else 0.0
+                ),
+                "brier_score": brier, "ece": ece,
+                "signed_calibration_gap": signed_gap,
+                "calibration_status": calibration_status,
+                "probability_contract_version": (
+                    PROBABILITY_CONTRACT_VERSION if probability_available else ""
+                ),
+                "sample_count": len(rows), "positive_count": int(y_true.sum()),
+                "negative_count": int((y_true == 0).sum()),
+                "parse_success_rate": parse_rates[strategy],
+                "error_reason_distribution": json.dumps(dict(Counter(
+                    row["semantic_error_reason"] for row in semantic_rows
+                )), sort_keys=True),
+                "classification_report": json.dumps({
+                    label: semantic_report[label] for label in semantic_labels
+                }, sort_keys=True),
+            })
             calibration_rows.extend([
-                {**bin_row, "app": app, "prompt_strategy": strategy}
+                {
+                    **bin_row,
+                    "app": app,
+                    "prompt_strategy": strategy,
+                    "probability_contract_version": PROBABILITY_CONTRACT_VERSION,
+                }
                 for bin_row in bins
             ])
-            correctness[strategy] = (y_true == y_pred).astype(int).tolist()
+            correctness[strategy] = semantic_correct
+            boolean_correctness[strategy] = (y_true == y_pred).astype(int).tolist()
         primary = _mcnemar(correctness["zero_shot"], correctness["cot"])
         stats_rows.append({
             "app": app, "test": "mcnemar_primary", "comparison": "cot vs zero_shot",
@@ -1476,7 +1793,28 @@ def _evaluate_cluster_population(
             {"app": app, "test": "wilcoxon_secondary", **row}
             for row in _wilcoxon(correctness)
         )
-    return app_status, metrics_rows, calibration_rows, stats_rows
+        for first, second in combinations(STRATEGIES, 2):
+            result = _mcnemar(boolean_correctness[first], boolean_correctness[second])
+            boolean_stats_rows.append({
+                "app": app,
+                "test": "mcnemar_primary" if (first, second) == ("zero_shot", "cot") else "mcnemar_secondary",
+                "comparison": f"{first} vs {second}", **result,
+            })
+        if len(next(iter(boolean_correctness.values()))) >= 2 and not (
+            np.array_equal(boolean_correctness["zero_shot"], boolean_correctness["few_shot"])
+            and np.array_equal(boolean_correctness["zero_shot"], boolean_correctness["cot"])
+        ):
+            friedman = friedmanchisquare(*[boolean_correctness[s] for s in STRATEGIES])
+            boolean_stats_rows.append({
+                "app": app, "test": "friedman", "comparison": "all strategies",
+                "statistic": float(friedman.statistic), "p_value": float(friedman.pvalue),
+            })
+        boolean_stats_rows.extend(
+            {"app": app, "test": "wilcoxon_secondary", **row}
+            for row in _wilcoxon(boolean_correctness)
+        )
+    return (app_status, metrics_rows, calibration_rows, stats_rows,
+            boolean_metrics_rows, boolean_stats_rows)
 
 
 def _population_status(app_status: dict, positive_count: int) -> str:
@@ -1493,6 +1831,8 @@ def _population_status(app_status: dict, positive_count: int) -> str:
 
 def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) -> dict:
     """Apply independent rules only after pipeline results have been persisted."""
+    taxonomy = load_semantic_taxonomy()
+    evaluation_protocol = _evaluation_protocol()
     by_strategy = _validate_pairs(records)
     base_alerts = [by_strategy[STRATEGIES[0]][alert_id] for alert_id in sorted(by_strategy[STRATEGIES[0]], key=lambda value: int(value))]
     validated, provisional = load_automated_rules()
@@ -1513,6 +1853,7 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
                 continue
             seen_cluster_strategies.add(key)
             match = audit_by_id[str(record["alert_id"])]
+            semantic = _semantic_assessment(record, match, taxonomy)
             triage_rows.append({
                 "zap_alert_name": record.get("alert_name", ""),
                 "app": record.get("app", ""),
@@ -1520,12 +1861,26 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
                 "cwe": record.get("zap_cwe_id", record.get("cweid", "")),
                 "strategy": strategy,
                 "llm_verdict": record.get("confirmed", ""),
-                "llm_confidence": record.get("confidence", ""),
+                "llm_vulnerability_probability": (
+                    _record_vulnerability_probability(record)
+                    if _record_vulnerability_probability(record) is not None
+                    else ""
+                ),
+                "probability_contract_version": record.get(
+                    "probability_contract_version", "legacy_undefined"
+                ),
+                "verdict_threshold": record.get("verdict_threshold", ""),
+                "legacy_llm_confidence": (
+                    record.get("confidence", "")
+                    if "vulnerability_probability" not in record
+                    else ""
+                ),
                 "assessment_origin": _assessment_origin(record),
                 "repair_attempted": bool(
                     record.get("repair_attempted", record.get("initial_parse_error"))
                 ),
                 "repaired": bool(record.get("repaired", False)),
+                **semantic,
                 "ground_truth_label": match["ground_truth_label"],
                 "matched_rule": match["matched_rule_id"],
                 "duplicate_count": record.get("dedup_cluster_size", 1),
@@ -1559,6 +1914,14 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
     }
     mapped_clusters = set(cluster_labels)
     records_by_cluster = _cluster_records(by_strategy)
+    semantic_by_cluster = {strategy: {} for strategy in STRATEGIES}
+    for strategy in STRATEGIES:
+        for cluster_id, record in records_by_cluster[strategy].items():
+            match = audit_by_id[str(record["alert_id"])]
+            if match["ground_truth_label"] in {"VULNERABLE", "NOT_VULNERABLE"}:
+                semantic_by_cluster[strategy][cluster_id] = _semantic_assessment(
+                    record, match, taxonomy
+                )
     cluster_apps = {
         row["cluster_id"]: row["app"]
         for row in audit
@@ -1569,14 +1932,17 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
     if parse_blocked:
         app_status = {app: "insufficient_parse_quality" for app in sorted(apps)}
         metrics_rows, calibration_rows, stats_rows = [], [], []
+        boolean_metrics_rows, boolean_stats_rows = [], []
     else:
-        app_status, metrics_rows, calibration_rows, stats_rows = _evaluate_cluster_population(
+        (app_status, metrics_rows, calibration_rows, stats_rows,
+         boolean_metrics_rows, boolean_stats_rows) = _evaluate_cluster_population(
             apps,
             eligible_clusters,
             cluster_labels,
             cluster_apps,
             records_by_cluster,
             parsed_rates,
+            semantic_by_cluster,
         )
 
     repair_free_clusters = {
@@ -1601,6 +1967,8 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
         sensitivity_metrics_rows,
         sensitivity_calibration_rows,
         sensitivity_stats_rows,
+        sensitivity_boolean_metrics_rows,
+        sensitivity_boolean_stats_rows,
     ) = _evaluate_cluster_population(
         apps,
         repair_free_clusters,
@@ -1608,6 +1976,7 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
         cluster_apps,
         records_by_cluster,
         initial_parsed_rates,
+        semantic_by_cluster,
     )
 
     total_validated_positive = sum(row["ground_truth_label"] == "VULNERABLE" for row in audit)
@@ -1624,20 +1993,47 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
         sensitivity_app_status,
         sensitivity_positive_count,
     )
+    operational_calibration_status = _calibration_contract_status(
+        eligible_clusters,
+        records_by_cluster,
+    )
+    sensitivity_calibration_status = _calibration_contract_status(
+        repair_free_clusters,
+        records_by_cluster,
+    )
     serialized_sensitivity_metrics = [
         {
             **row,
-            "prediction_distribution": json.loads(row["prediction_distribution"]),
             "classification_report": json.loads(row["classification_report"]),
+            "error_reason_distribution": json.loads(row["error_reason_distribution"]),
         }
         for row in sensitivity_metrics_rows
     ]
     summary = {
         "evaluation_status": status, "app_status": app_status,
+        "evaluation_protocol": evaluation_protocol,
+        "probability_contract": {
+            **PROBABILITY_CONTRACT,
+            "operational_calibration_status": operational_calibration_status,
+            "initial_only_calibration_status": sensitivity_calibration_status,
+            "legacy_policy": (
+                "Legacy confidence is retained only as legacy_llm_confidence and is never "
+                "used for vulnerability-probability calibration."
+            ),
+        },
         "coverage": {"raw_alert_count": len(audit), "validated_mapped_alert_count": sum(row["ground_truth_label"] in {"VULNERABLE", "NOT_VULNERABLE"} for row in audit), "validated_positive_alert_count": total_validated_positive, "unmapped_alert_count": sum(row["ground_truth_label"] == "UNMAPPED" for row in audit), "provisional_alert_count": sum(row["ground_truth_label"] == "PROVISIONAL" for row in audit)},
         "parse_quality": {"threshold": PARSE_SUCCESS_THRESHOLD, "strategies": parsed_rates, "below_threshold_strategies": parse_blocked, "complete_mapped_cluster_count": len(complete_clusters), "excluded_mapped_cluster_count": len(mapped_clusters - complete_clusters)},
-        "metrics": [{**row, "prediction_distribution": json.loads(row["prediction_distribution"]), "classification_report": json.loads(row["classification_report"])} for row in metrics_rows],
+        "metrics": [{**row, "classification_report": json.loads(row["classification_report"]), "error_reason_distribution": json.loads(row["error_reason_distribution"])} for row in metrics_rows],
         "statistics": stats_rows,
+        "boolean_verdict_sensitivity": {
+            "contract": "binary-vulnerability-existence-sensitivity",
+            "metrics": [{
+                **row,
+                "prediction_distribution": json.loads(row["prediction_distribution"]),
+                "classification_report": json.loads(row["classification_report"]),
+            } for row in boolean_metrics_rows],
+            "statistics": boolean_stats_rows,
+        },
         "initial_only_sensitivity": {
             "evaluation_status": sensitivity_status,
             "policy": (
@@ -1649,21 +2045,43 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
             "excluded_cluster_count": len(mapped_clusters - repair_free_clusters),
             "repaired_cluster_count_by_strategy": repaired_cluster_counts,
             "initial_parse_success_rate_by_strategy": initial_parsed_rates,
+            "calibration_status": sensitivity_calibration_status,
             "app_status": sensitivity_app_status,
             "metrics": serialized_sensitivity_metrics,
             "statistics": sensitivity_stats_rows,
+            "boolean_verdict_sensitivity": {
+                "metrics": [{
+                    **row,
+                    "prediction_distribution": json.loads(row["prediction_distribution"]),
+                    "classification_report": json.loads(row["classification_report"]),
+                } for row in sensitivity_boolean_metrics_rows],
+                "statistics": sensitivity_boolean_stats_rows,
+            },
         },
         "validation_coverage": validation_coverage,
     }
     _write_json(run_dir / "evaluation_summary.json", summary)
+    _write_json(run_dir / "evaluation_protocol.json", evaluation_protocol)
     pd.DataFrame(metrics_rows).to_csv(run_dir / "evaluation_results.csv", index=False)
     pd.DataFrame(stats_rows).to_csv(run_dir / "statistical_results.csv", index=False)
+    pd.DataFrame(boolean_metrics_rows).to_csv(
+        run_dir / "boolean_verdict_evaluation_results.csv", index=False,
+    )
+    pd.DataFrame(boolean_stats_rows).to_csv(
+        run_dir / "boolean_verdict_statistical_results.csv", index=False,
+    )
     pd.DataFrame(calibration_rows).to_csv(run_dir / "calibration_results.csv", index=False)
     pd.DataFrame(sensitivity_metrics_rows).to_csv(
         run_dir / "initial_only_evaluation_results.csv", index=False,
     )
     pd.DataFrame(sensitivity_stats_rows).to_csv(
         run_dir / "initial_only_statistical_results.csv", index=False,
+    )
+    pd.DataFrame(sensitivity_boolean_metrics_rows).to_csv(
+        run_dir / "initial_only_boolean_verdict_evaluation_results.csv", index=False,
+    )
+    pd.DataFrame(sensitivity_boolean_stats_rows).to_csv(
+        run_dir / "initial_only_boolean_verdict_statistical_results.csv", index=False,
     )
     pd.DataFrame(sensitivity_calibration_rows).to_csv(
         run_dir / "initial_only_calibration_results.csv", index=False,
@@ -1712,8 +2130,9 @@ def run_automated(
             "run_id": run_id, "created_at_utc": datetime.now(timezone.utc).isoformat(), "git_revision": _git_revision(),
             "scan_profile": scan_profile, "targets": TARGETS, "model": model, "nim_base_url": NIM_BASE_URL,
             "temperature": TEMPERATURE, "max_completion_tokens": MAX_COMPLETION_TOKENS, "strategies": STRATEGIES,
-            "prompt_template_version": "automated-post-triage-v2-repair-context",
+            "prompt_template_version": "automated-post-triage-v3-vulnerability-probability",
             "triage_protocol_sha256": protocol_sha256,
+            "probability_contract": PROBABILITY_CONTRACT,
             "few_shot_examples": examples_metadata,
             "source_alert_count": len(canonical), "cluster_count": len(clusters),
         }

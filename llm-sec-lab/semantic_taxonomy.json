@@ -1,0 +1,15 @@
+{
+  "version": "semantic-taxonomy-v1",
+  "families": {
+    "sql_injection": {
+      "aliases": [
+        "sqli",
+        "blind sql injection",
+        "error-based sql injection",
+        "error based sql injection",
+        "union-based sql injection",
+        "union based sql injection"
+      ]
+    }
+  }
+}
