@@ -824,6 +824,8 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                 "matched_rule_id": f"rule_{cluster_id}", "rule_status": "validated",
                 "provider_key": "provider" if confirmed else "", "rationale": "fixture",
                 "validation_basis": "fixture", "source_ref": "fixture",
+                "expected_vulnerability_family": "sql_injection" if confirmed else "",
+                "compatible_llm_cwe_ids": ("CWE-89",) if confirmed else (),
             }
             for cluster_id, alert_id, confirmed, _origin in cluster_specs
         ]
@@ -857,6 +859,14 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
             self.assertEqual(summary["probability_contract"]["operational_calibration_status"], "available")
             self.assertEqual(sensitivity["calibration_status"], "available")
             self.assertTrue((run_dir / "initial_only_evaluation_results.csv").is_file())
+            self.assertEqual(
+                operational["zero_shot"]["semantic_label_universe"],
+                sensitivity_metrics["zero_shot"]["semantic_label_universe"],
+            )
+            self.assertEqual(
+                operational["zero_shot"]["semantic_label_universe"],
+                ["SAFE", "sql_injection|CWE-89", "OTHER_POSITIVE"],
+            )
 
     def test_legacy_confidence_is_readable_but_excluded_from_calibration(self):
         cluster_specs = [("positive", "0", True), ("negative", "1", False)]
@@ -882,6 +892,8 @@ class AutomatedResearchPipelineTests(unittest.TestCase):
                 "matched_rule_id": f"rule_{cluster_id}", "rule_status": "validated",
                 "provider_key": "provider" if confirmed else "", "rationale": "fixture",
                 "validation_basis": "fixture", "source_ref": "fixture",
+                "expected_vulnerability_family": "sql_injection" if confirmed else "",
+                "compatible_llm_cwe_ids": ("CWE-89",) if confirmed else (),
             }
             for cluster_id, alert_id, confirmed in cluster_specs
         ]

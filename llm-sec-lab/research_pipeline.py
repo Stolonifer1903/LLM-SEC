@@ -98,6 +98,7 @@ TRIAGE_RESULT_COLUMNS = (
     "canonical_model_cwe", "expected_vulnerability_family",
     "compatible_llm_cwe_ids", "family_compatible", "cwe_compatible",
     "semantic_ground_truth_label", "semantic_predicted_label",
+    "semantic_evaluation_predicted_label", "semantic_label_universe",
     "semantic_correct", "semantic_error_reason",
     "ground_truth_label", "matched_rule", "duplicate_count",
 )
@@ -118,13 +119,30 @@ PROBABILITY_CONTRACT = {
     "derived_verdict": f"confirmed = vulnerability_probability >= {VERDICT_THRESHOLD}",
     "threshold": VERDICT_THRESHOLD,
 }
-EVALUATION_PROTOCOL_VERSION = "semantic-v1"
+EVALUATION_PROTOCOL_VERSION = "semantic-v2"
+OTHER_POSITIVE_LABEL = "OTHER_POSITIVE"
+SEMANTIC_LABEL_UNIVERSE_POLICY = {
+    "version": "fixed-validated-ground-truth-v1",
+    "scope": "one ordered universe per application, shared by every strategy and population",
+    "source": "validated mapped ground-truth labels present in the run",
+    "order": "SAFE, sorted canonical positive labels, OTHER_POSITIVE",
+    "prediction_mapping": (
+        "SAFE and in-universe canonical positive predictions are retained; all other "
+        "confirmed diagnoses map to OTHER_POSITIVE for classification reporting"
+    ),
+    "macro_average": "all ordered labels are always averaged with zero_division=0",
+    "score_ceiling_note": (
+        "When SAFE and one canonical positive are the only ground-truth labels, a perfect "
+        "classifier scores 2/3 because OTHER_POSITIVE has zero support."
+    ),
+}
 SEMANTIC_SCORING_POLICY = {
     "prediction": "confirmed=false=>SAFE; confirmed=true=>canonical_family|normalized_CWE",
     "positive_correctness": "verdict and exact family alias and compatible CWE",
     "negative_correctness": "only confirmed=false is SAFE",
     "unknown_family": "UNRECOGNIZED",
     "invalid_cwe": "INVALID_CWE",
+    "macro_f1_label_universe": SEMANTIC_LABEL_UNIVERSE_POLICY,
 }
 PROVENANCE_MATCHING_POLICY = {
     "explicit_target_version": "exact_match_required",
@@ -1197,6 +1215,41 @@ def _compatible_cwes(value: str) -> tuple[str, ...]:
     return normalized
 
 
+def _semantic_ground_truth_label(match: dict) -> str:
+    if match["ground_truth_label"] == "NOT_VULNERABLE":
+        return "SAFE"
+    expected_family = match.get("expected_vulnerability_family", "")
+    expected_cwes = tuple(match.get("compatible_llm_cwe_ids", ()))
+    if expected_family and expected_cwes:
+        return f"{expected_family}|{expected_cwes[0]}"
+    return "UNRESOLVED_GROUND_TRUTH"
+
+
+def _semantic_label_universes(audit: list[dict]) -> dict[str, list[str]]:
+    """Build one stable application label universe before population filtering."""
+    applications = sorted({str(row.get("app", "")) for row in audit})
+    positive_labels = {app: set() for app in applications}
+    for row in audit:
+        if row.get("ground_truth_label") != "VULNERABLE":
+            continue
+        label = _semantic_ground_truth_label(row)
+        if label == "UNRESOLVED_GROUND_TRUTH":
+            raise ValueError(
+                "Validated vulnerable matches require a resolved canonical semantic label"
+            )
+        positive_labels[str(row.get("app", ""))].add(label)
+    return {
+        app: ["SAFE", *sorted(positive_labels[app]), OTHER_POSITIVE_LABEL]
+        for app in applications
+    }
+
+
+def _semantic_evaluation_prediction(predicted: str, label_universe: list[str]) -> str:
+    if predicted == "SAFE" or predicted in label_universe[1:-1]:
+        return predicted
+    return OTHER_POSITIVE_LABEL
+
+
 def _semantic_assessment(record: dict, match: dict, taxonomy: dict) -> dict:
     confirmed = record.get("confirmed")
     raw_family = str(record.get("vulnerability_type", "")).strip()
@@ -1205,10 +1258,7 @@ def _semantic_assessment(record: dict, match: dict, taxonomy: dict) -> dict:
     canonical_cwe = _strict_cwe(raw_cwe) or "INVALID_CWE"
     expected_family = match.get("expected_vulnerability_family", "")
     expected_cwes = tuple(match.get("compatible_llm_cwe_ids", ()))
-    truth = "SAFE" if match["ground_truth_label"] == "NOT_VULNERABLE" else (
-        f"{expected_family}|{expected_cwes[0]}" if expected_family and expected_cwes
-        else "UNRESOLVED_GROUND_TRUTH"
-    )
+    truth = _semantic_ground_truth_label(match)
     predicted = "SAFE" if confirmed is False else f"{canonical_family}|{canonical_cwe}"
     family_ok = bool(expected_family and canonical_family == expected_family)
     cwe_ok = bool(expected_cwes and canonical_cwe in expected_cwes)
@@ -1258,6 +1308,7 @@ def _evaluation_protocol(taxonomy_path=SEMANTIC_TAXONOMY_PATH, rules_path=RULES_
         "validation_overlay_sha256": hashlib.sha256(Path(validation_path).read_bytes()).hexdigest(),
         "taxonomy_version": taxonomy["version"],
         "semantic_rule_fields": ["expected_vulnerability_family", "compatible_llm_cwe_ids"],
+        "semantic_label_universe_policy": SEMANTIC_LABEL_UNIVERSE_POLICY,
         "provenance_matching_policy": PROVENANCE_MATCHING_POLICY,
     }
     encoded = json.dumps(components, sort_keys=True, separators=(",", ":")).encode()
@@ -1637,11 +1688,13 @@ def _evaluate_cluster_population(
     records_by_cluster: dict[str, dict[str, dict]],
     parse_rates: dict[str, float],
     semantic_by_cluster: dict[str, dict[str, dict]],
+    semantic_label_universes: dict[str, list[str]],
 ) -> tuple[dict, list[dict], list[dict], list[dict], list[dict], list[dict]]:
     app_status = {}
     metrics_rows, calibration_rows, stats_rows = [], [], []
     boolean_metrics_rows, boolean_stats_rows = [], []
     for app in sorted(apps):
+        semantic_labels = semantic_label_universes[app]
         app_clusters = {
             cluster_id
             for cluster_id in population_clusters
@@ -1673,6 +1726,14 @@ def _evaluate_cluster_population(
             semantic_rows = [semantic_by_cluster[strategy][cluster_id] for cluster_id in sorted(app_clusters)]
             semantic_true = [row["semantic_ground_truth_label"] for row in semantic_rows]
             semantic_pred = [row["semantic_predicted_label"] for row in semantic_rows]
+            semantic_evaluation_pred = [
+                _semantic_evaluation_prediction(label, semantic_labels)
+                for label in semantic_pred
+            ]
+            if any(label not in semantic_labels for label in semantic_true):
+                raise ValueError(
+                    f"Semantic ground truth for {app} is outside its fixed label universe"
+                )
             semantic_correct = [int(row["semantic_correct"]) for row in semantic_rows]
             probabilities = [row[2] for row in rows]
             probability_available = all(value is not None for value in probabilities)
@@ -1724,9 +1785,8 @@ def _evaluate_cluster_population(
                     label: report[label] for label in ("SAFE", "VULNERABLE")
                 }),
             })
-            semantic_labels = sorted(set(semantic_true) | set(semantic_pred))
             semantic_report = classification_report(
-                semantic_true, semantic_pred, labels=semantic_labels,
+                semantic_true, semantic_evaluation_pred, labels=semantic_labels,
                 output_dict=True, zero_division=0,
             )
             positive_mask = np.array(y_true, dtype=bool)
@@ -1735,7 +1795,7 @@ def _evaluate_cluster_population(
                 "app": app, "prompt_strategy": strategy,
                 "semantic_exact_match_accuracy": accuracy_score(semantic_true, semantic_pred),
                 "semantic_macro_f1": f1_score(
-                    semantic_true, semantic_pred, labels=semantic_labels,
+                    semantic_true, semantic_evaluation_pred, labels=semantic_labels,
                     average="macro", zero_division=0,
                 ),
                 "validated_positive_semantic_recall": (
@@ -1751,6 +1811,8 @@ def _evaluate_cluster_population(
                 "sample_count": len(rows), "positive_count": int(y_true.sum()),
                 "negative_count": int((y_true == 0).sum()),
                 "parse_success_rate": parse_rates[strategy],
+                "semantic_label_universe_policy": SEMANTIC_LABEL_UNIVERSE_POLICY["version"],
+                "semantic_label_universe": json.dumps(semantic_labels),
                 "error_reason_distribution": json.dumps(dict(Counter(
                     row["semantic_error_reason"] for row in semantic_rows
                 )), sort_keys=True),
@@ -1837,6 +1899,7 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
     base_alerts = [by_strategy[STRATEGIES[0]][alert_id] for alert_id in sorted(by_strategy[STRATEGIES[0]], key=lambda value: int(value))]
     validated, provisional = load_automated_rules()
     audit = build_match_audit(base_alerts, validated, provisional)
+    semantic_label_universes = _semantic_label_universes(audit)
     pd.DataFrame(audit).to_csv(run_dir / "ground_truth_match_audit.csv", index=False)
     unmapped = [row for row in audit if row["ground_truth_label"] in {"UNMAPPED", "PROVISIONAL"}]
     _write_json(run_dir / "unmapped_alerts.json", unmapped)
@@ -1854,6 +1917,7 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
             seen_cluster_strategies.add(key)
             match = audit_by_id[str(record["alert_id"])]
             semantic = _semantic_assessment(record, match, taxonomy)
+            label_universe = semantic_label_universes[str(record.get("app", ""))]
             triage_rows.append({
                 "zap_alert_name": record.get("alert_name", ""),
                 "app": record.get("app", ""),
@@ -1881,6 +1945,13 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
                 ),
                 "repaired": bool(record.get("repaired", False)),
                 **semantic,
+                "semantic_evaluation_predicted_label": (
+                    _semantic_evaluation_prediction(
+                        semantic["semantic_predicted_label"], label_universe,
+                    )
+                    if isinstance(record.get("confirmed"), bool) else ""
+                ),
+                "semantic_label_universe": json.dumps(label_universe),
                 "ground_truth_label": match["ground_truth_label"],
                 "matched_rule": match["matched_rule_id"],
                 "duplicate_count": record.get("dedup_cluster_size", 1),
@@ -1943,6 +2014,7 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
             records_by_cluster,
             parsed_rates,
             semantic_by_cluster,
+            semantic_label_universes,
         )
 
     repair_free_clusters = {
@@ -1977,6 +2049,7 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
         records_by_cluster,
         initial_parsed_rates,
         semantic_by_cluster,
+        semantic_label_universes,
     )
 
     total_validated_positive = sum(row["ground_truth_label"] == "VULNERABLE" for row in audit)
@@ -2006,12 +2079,17 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
             **row,
             "classification_report": json.loads(row["classification_report"]),
             "error_reason_distribution": json.loads(row["error_reason_distribution"]),
+            "semantic_label_universe": json.loads(row["semantic_label_universe"]),
         }
         for row in sensitivity_metrics_rows
     ]
     summary = {
         "evaluation_status": status, "app_status": app_status,
         "evaluation_protocol": evaluation_protocol,
+        "semantic_label_universe": {
+            "policy": SEMANTIC_LABEL_UNIVERSE_POLICY,
+            "by_app": semantic_label_universes,
+        },
         "probability_contract": {
             **PROBABILITY_CONTRACT,
             "operational_calibration_status": operational_calibration_status,
@@ -2023,7 +2101,12 @@ def evaluate_post_triage(run_dir: Path, records: list[dict], diagnostics: dict) 
         },
         "coverage": {"raw_alert_count": len(audit), "validated_mapped_alert_count": sum(row["ground_truth_label"] in {"VULNERABLE", "NOT_VULNERABLE"} for row in audit), "validated_positive_alert_count": total_validated_positive, "unmapped_alert_count": sum(row["ground_truth_label"] == "UNMAPPED" for row in audit), "provisional_alert_count": sum(row["ground_truth_label"] == "PROVISIONAL" for row in audit)},
         "parse_quality": {"threshold": PARSE_SUCCESS_THRESHOLD, "strategies": parsed_rates, "below_threshold_strategies": parse_blocked, "complete_mapped_cluster_count": len(complete_clusters), "excluded_mapped_cluster_count": len(mapped_clusters - complete_clusters)},
-        "metrics": [{**row, "classification_report": json.loads(row["classification_report"]), "error_reason_distribution": json.loads(row["error_reason_distribution"])} for row in metrics_rows],
+        "metrics": [{
+            **row,
+            "classification_report": json.loads(row["classification_report"]),
+            "error_reason_distribution": json.loads(row["error_reason_distribution"]),
+            "semantic_label_universe": json.loads(row["semantic_label_universe"]),
+        } for row in metrics_rows],
         "statistics": stats_rows,
         "boolean_verdict_sensitivity": {
             "contract": "binary-vulnerability-existence-sensitivity",

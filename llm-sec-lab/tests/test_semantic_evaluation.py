@@ -107,11 +107,74 @@ class SemanticEvaluationTests(unittest.TestCase):
         result = pipeline._evaluate_cluster_population(
             {"fixture"}, clusters, labels, apps, records,
             {strategy: 1.0 for strategy in pipeline.STRATEGIES}, semantics,
+            {"fixture": ["SAFE", "sql_injection|CWE-89", "OTHER_POSITIVE"]},
         )
         semantic_stats, boolean_stats = result[3], result[5]
         semantic_primary = next(row for row in semantic_stats if row["test"] == "mcnemar_primary")
         boolean_cot = next(row for row in boolean_stats if row["comparison"] == "zero_shot vs cot")
         self.assertNotEqual(semantic_primary["table"], boolean_cot["table"])
+
+    def test_fixed_label_universe_maps_strategy_specific_errors_to_other_positive(self):
+        audit = [
+            {"app": "fixture", "ground_truth_label": "NOT_VULNERABLE"},
+            {
+                "app": "fixture", "ground_truth_label": "VULNERABLE",
+                "expected_vulnerability_family": "sql_injection",
+                "compatible_llm_cwe_ids": ("CWE-89",),
+            },
+        ]
+        universe = pipeline._semantic_label_universes(audit)["fixture"]
+        self.assertEqual(
+            universe, ["SAFE", "sql_injection|CWE-89", "OTHER_POSITIVE"],
+        )
+        self.assertEqual(
+            pipeline._semantic_evaluation_prediction("UNRECOGNIZED|CWE-79", universe),
+            "OTHER_POSITIVE",
+        )
+        self.assertEqual(
+            pipeline._semantic_evaluation_prediction("sql_injection|CWE-89", universe),
+            "sql_injection|CWE-89",
+        )
+
+    def test_perfect_two_truth_label_classifier_has_two_thirds_macro_f1(self):
+        clusters = {"positive", "negative"}
+        labels = {"positive": True, "negative": False}
+        apps = {cluster: "fixture" for cluster in clusters}
+        records = {strategy: {} for strategy in pipeline.STRATEGIES}
+        semantics = {strategy: {} for strategy in pipeline.STRATEGIES}
+        for strategy in pipeline.STRATEGIES:
+            for cluster in clusters:
+                positive = cluster == "positive"
+                record = {
+                    "confirmed": positive,
+                    "vulnerability_probability": 0.9 if positive else 0.1,
+                    "probability_contract_version": pipeline.PROBABILITY_CONTRACT_VERSION,
+                    "vulnerability_type": "SQL Injection" if positive else "none",
+                    "cwe_id": "CWE-89" if positive else "CWE-0",
+                }
+                records[strategy][cluster] = record
+                semantics[strategy][cluster] = pipeline._semantic_assessment(
+                    record, self.positive if positive else self.negative, self.taxonomy,
+                )
+        universe = ["SAFE", "sql_injection|CWE-89", "OTHER_POSITIVE"]
+        result = pipeline._evaluate_cluster_population(
+            {"fixture"}, clusters, labels, apps, records,
+            {strategy: 1.0 for strategy in pipeline.STRATEGIES}, semantics,
+            {"fixture": universe},
+        )
+        self.assertTrue(all(row["semantic_macro_f1"] == 2 / 3 for row in result[1]))
+        self.assertTrue(all(json.loads(row["semantic_label_universe"]) == universe for row in result[1]))
+
+    def test_evaluation_fingerprint_covers_label_universe_policy(self):
+        original = pipeline._evaluation_protocol()
+        with patch.object(
+            pipeline,
+            "SEMANTIC_LABEL_UNIVERSE_POLICY",
+            {"version": "different-label-universe-policy"},
+        ):
+            modified = pipeline._evaluation_protocol()
+        self.assertNotEqual(original["fingerprint_sha256"], modified["fingerprint_sha256"])
+        self.assertEqual(original["version"], "semantic-v2")
 
     def test_cwe_equivalence_parser_rejects_malformed_and_duplicate_values(self):
         with self.assertRaisesRegex(ValueError, "Invalid or duplicate"):
