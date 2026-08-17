@@ -179,7 +179,7 @@ python run_pipeline.py --resume-from results/runs/<incomplete_triage_run_id>
 ```
 
 Checkpoint state includes a triage-protocol fingerprint covering the prompts, response
-schema, repair instruction, strategy list, and few-shot examples. A checkpoint created
+schema, probability contract, repair instruction, strategy list, and few-shot examples. A checkpoint created
 under an older or different protocol is rejected; start a new triage run from its saved
 complete `raw_alerts.json` with `--reuse-from` instead of mixing assessment protocols.
 
@@ -205,27 +205,67 @@ Each application runs in a new ZAP session. A controlled stage timeout is stoppe
 
 Each run creates its immutable directory under `results/runs/<run_id>/` before scanning. `scan_status.json` records run, target, attempt, and stage outcomes. Every attempt is checkpointed under `targets/<app>/attempt_<n>/`. Completed two-app scans write aggregate `raw_alerts.json`; failed or interrupted scans write `partial_raw_alerts.json` instead and cannot be selected automatically by `--reuse-from`. The scan and inference stages never read ground truth. The targeted profile retains the scanner's seeded requests and focused active rules.
 
-The pipeline deduplicates exact prompt-equivalent alerts, triages every unique cluster, and re-expands predictions to raw alerts. It runs `zero_shot`, `few_shot`, and `cot` without explicit confidence elicitation. The bundled few-shot examples are generic, source-cited, and do not identify either study application.
+The pipeline deduplicates exact prompt-equivalent alerts, triages every unique cluster, and re-expands predictions to raw alerts. It runs `zero_shot`, `few_shot`, and `cot` under one explicit probability contract: `vulnerability_probability` is the probability that the supplied alert represents a real, exploitable vulnerability in the target, conditioned only on the supplied alert fields. It is not confidence in the explanation, predicted family, CWE, severity, or ZAP itself. The model does not emit a separate Boolean verdict; the pipeline derives `confirmed = vulnerability_probability >= 0.5`. The bundled few-shot examples are schema-complete, generic, source-cited, and do not identify either study application.
 
 If an initial response fails strict JSON parsing, the single automated repair attempt
 replays the same alert and prompt strategy, includes the malformed response and parse
 error, and asks the model to preserve every recoverable assessment value. Repair never
 receives ground truth. Each result records `initial_parsed_successfully`,
 `repair_attempted`, `repaired`, and `assessment_origin`; an unsuccessful repair remains
-unparsed and is excluded from metrics rather than being treated as safe.
+unparsed with no probability or verdict and is excluded from metrics rather than being
+treated as safe.
 
-Only after `pipeline_results.json` is written does the evaluator use `ground_truth_match_rules.csv`. A rule requires exact app, controlled alert-family name, ZAP-provided CWE, route constraint, and evidence constraint. It never uses the model prediction, rationale, predicted CWE, severity, or confidence to assign a label.
+Only after `pipeline_results.json` is written does the evaluator use `ground_truth_match_rules.csv`. A rule requires exact app, controlled alert-family name, ZAP-provided CWE, route constraint, and evidence constraint. Positive rules additionally require a canonical family from `semantic_taxonomy.json` and one or more explicit compatible model CWEs. It never uses the model prediction, rationale, predicted CWE, severity, or probability to assign a ground-truth label.
 
 Alerts with no validated rule remain in `unmapped_alerts.json` and the match audit, but are not assumed safe. Candidate and supporting-only validation-overlay matches are retained as provisional audit evidence and excluded from primary metrics.
 
-Each run produces the scan report, raw alerts, clusters, pipeline results, parse diagnostics, rule audit, unmapped-alert audit, evaluation summary, classification metrics, calibration bins, and statistical output in the same run directory. Juice Shop and OWASP VulnerableApp are evaluated separately.
+Each run produces the scan report, raw alerts, clusters, pipeline results, parse diagnostics, rule audit, unmapped-alert audit, evaluation summary, classification metrics, calibration bins, and statistical output in the same run directory. `evaluation_protocol.json` records the `semantic-v1` scoring contract and a fingerprint over its policy, taxonomy, match rules, and validation overlay. Juice Shop and OWASP VulnerableApp are evaluated separately.
+
+The primary outcome is semantic exact match: `SAFE` or canonical
+`vulnerability_family|CWE`. Exact taxonomy aliases are accepted; fuzzy and substring
+matching are not. `evaluation_results.csv` and `statistical_results.csv` are semantic
+primary, including exact-match accuracy, macro F1, validated-positive semantic recall,
+per-label results, and paired tests over semantic correctness. The former Boolean
+verdict analysis is retained explicitly in
+`boolean_verdict_evaluation_results.csv` and
+`boolean_verdict_statistical_results.csv`.
 
 Operational metrics use every final parsed assessment. The evaluator also writes
 `initial_only_evaluation_results.csv`, `initial_only_statistical_results.csv`, and
 `initial_only_calibration_results.csv`. This paired sensitivity population excludes a
 cluster from all three strategies whenever any strategy required repair or failed its
 initial parse, preventing repair-rate differences from being mistaken for a prompt
-strategy effect.
+strategy effect. The same population also receives separate initial-only Boolean files;
+calibration remains a third, independently named section.
+
+Brier score, ECE, calibration bins, and signed calibration gap use only a
+contract-versioned `vulnerability_probability`. Historical completed artifacts remain
+readable for Boolean and provenance reporting, but their ambiguous `confidence` value
+is retained only as `legacy_llm_confidence`; legacy confidence is never silently
+reinterpreted as vulnerability probability, and calibration is reported as unavailable.
+Family/CWE compatibility never enters Brier score, ECE, or calibration bins: those
+continue to measure only validated binary vulnerability existence.
+
+VulnerableApp rule provenance can be refreshed without scanning or route discovery:
+
+```bash
+python -B verify_rule_provenance.py \
+  --run-dir results/runs/run_20260813T124614Z \
+  --environment-lock environment-lock.json
+```
+
+The helper refuses non-local targets and mismatched release/image metadata, then sends
+only six fixed GET payload/control pairs for parameter `id`. It stores bounded response
+evidence, hashes, oracle outcomes, the pinned image, environment-lock hash, and
+commit-pinned official source references in a new timestamped artifact.
+
+Rule matching treats an explicit alert `target_version` as an exact constraint. When a
+frozen alert records the version as blank or `unknown`, the rule may bind only if its
+non-empty image digest and environment-lock SHA-256 both match the alert exactly. An
+explicit version conflict, missing immutable identifier, or identifier mismatch remains
+unmapped. `ground_truth_match_audit.csv` records the resulting
+`version_match_basis` (`exact`, `immutable_provenance`, or `conflict` where applicable),
+and this policy is covered by the evaluation-protocol fingerprint.
 
 If no validated positive rule matches, or parse quality is below the configured threshold, the run still completes and writes all audit artefacts with an explicit insufficient-evidence status. It does not manufacture invalid F1 or statistical results.
 
