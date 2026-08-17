@@ -30,6 +30,15 @@ class GroundTruthValidationOverlayTests(unittest.TestCase):
             self.assertEqual(len(positive_rules), 6)
             self.assertEqual(len(provisional), 1)
             self.assertEqual(provisional[0]["rule_status"], "candidate_version_unbound")
+        vulnerable_positives = [
+            rule for rule in positive_rules if rule["app"] == "vulnerable_app"
+        ]
+        self.assertEqual(len(vulnerable_positives), 6)
+        self.assertTrue(all(
+            rule["validation_basis"] == "official_source_and_paired_replay"
+            and "vulnerableapp_provenance_20260816T005336Z/verification.json" in rule["source_ref"]
+            for rule in vulnerable_positives
+        ))
 
     def test_overlay_defaults_cover_unlisted_catalogue_challenges(self):
         with tempfile.TemporaryDirectory() as directory:

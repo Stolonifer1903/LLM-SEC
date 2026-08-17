@@ -63,11 +63,21 @@ class GroundTruthRuleTests(unittest.TestCase):
             "environment_lock_sha256": "lock",
         }
         self.assertEqual(match_alert_to_ground_truth(alert, [rule])["ground_truth_label"], "VULNERABLE")
+        inferred = match_alert_to_ground_truth({**alert, "target_version": "unknown"}, [rule])
+        self.assertEqual(inferred["ground_truth_label"], "VULNERABLE")
+        self.assertEqual(inferred["version_match_basis"], "immutable_provenance")
+        self.assertEqual(
+            match_alert_to_ground_truth(
+                {**alert, "target_version": "unknown", "environment_lock_sha256": "different"},
+                [rule],
+            )["ground_truth_label"],
+            "UNMAPPED",
+        )
         for field, value in (("request_method", "POST"), ("param", "id"), ("plugin_id", "40019"), ("target_version", "18.0.0")):
-            self.assertEqual(
-                match_alert_to_ground_truth({**alert, field: value}, [rule])["ground_truth_label"],
-                "UNMAPPED",
-            )
+            mismatch = match_alert_to_ground_truth({**alert, field: value}, [rule])
+            self.assertEqual(mismatch["ground_truth_label"], "UNMAPPED")
+            if field == "target_version":
+                self.assertEqual(mismatch["version_match_basis"], "conflict")
 
     @classmethod
     def setUpClass(cls):

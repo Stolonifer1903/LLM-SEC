@@ -60,6 +60,8 @@ VALIDATION_PROVENANCE_COLUMNS = RULE_PROVENANCE_COLUMNS
 VALIDATION_STATUSES = {
     "validated", "candidate", "supporting_only", "manual_required", "out_of_scope",
 }
+UNKNOWN_TARGET_VERSION_VALUES = {"", "unknown"}
+ACCEPTED_VERSION_MATCH_BASES = {"not_required", "exact", "immutable_provenance"}
 
 
 def normalize_text(value) -> str:
@@ -83,6 +85,33 @@ def normalize_url_path(value) -> str:
     if len(path) > 1:
         path = path.rstrip("/")
     return path
+
+
+def target_version_match_basis(rule: dict, alert: dict) -> str:
+    """Resolve target-version evidence while preserving strict provenance.
+
+    An explicit alert version must match exactly. A frozen alert with no usable
+    version may bind only through exact, non-empty image-digest and
+    environment-lock identifiers declared by the rule.
+    """
+    required_version = str(rule.get("target_version", "")).strip()
+    if not required_version:
+        return "not_required"
+
+    alert_version = str(alert.get("target_version", "")).strip()
+    if alert_version.lower() not in UNKNOWN_TARGET_VERSION_VALUES:
+        return "exact" if alert_version == required_version else "conflict"
+
+    required_digest = str(rule.get("target_image_digest", "")).strip()
+    required_lock = str(rule.get("environment_lock_sha256", "")).strip()
+    if (
+        required_digest
+        and required_lock
+        and required_digest == str(alert.get("target_image_digest", "")).strip()
+        and required_lock == str(alert.get("environment_lock_sha256", "")).strip()
+    ):
+        return "immutable_provenance"
+    return "insufficient_immutable_provenance"
 
 
 def _split_challenge_ids(value) -> list[str]:
@@ -224,6 +253,8 @@ def load_detection_validation(path, gt: pd.DataFrame) -> pd.DataFrame:
 
 def load_match_rules(path="ground_truth_match_rules.csv", gt: pd.DataFrame = None, validation: pd.DataFrame = None) -> list[dict]:
     rules_df = pd.read_csv(path, dtype=str).fillna("")
+    if "rule_status" in rules_df.columns:
+        rules_df = rules_df[rules_df["rule_status"].str.strip().str.lower() == "validated"].copy()
     missing = set(RULE_COLUMNS).difference(rules_df.columns)
     if missing:
         raise ValueError(f"Ground-truth rules are missing columns: {sorted(missing)}")
@@ -341,10 +372,19 @@ def _rule_matches_alert(rule: dict, alert: dict) -> bool:
     authentication = str(alert.get("authentication_context", "")).strip().lower()
     if (rule.get("authentication_context") or "") not in {"", "any", authentication}:
         return False
-    for field in ("target_version", "target_image_digest", "environment_lock_sha256"):
+    for field in ("target_image_digest", "environment_lock_sha256"):
         if rule.get(field) and rule[field] != str(alert.get(field, "")).strip():
             return False
-    return True
+    return target_version_match_basis(rule, alert) in ACCEPTED_VERSION_MATCH_BASES
+
+
+def _unmatched_version_basis(alert: dict, rules: list[dict]) -> str:
+    for rule in rules:
+        if target_version_match_basis(rule, alert) != "conflict":
+            continue
+        if _rule_matches_alert({**rule, "target_version": ""}, alert):
+            return "conflict"
+    return ""
 
 
 def match_alert_to_ground_truth(alert: dict, rules: list[dict]) -> dict:
@@ -364,6 +404,7 @@ def match_alert_to_ground_truth(alert: dict, rules: list[dict]) -> dict:
             "rationale": "No defensible ground-truth rule matched this alert.",
             "validation_basis": "",
             "source_ref": "",
+            "version_match_basis": _unmatched_version_basis(alert, rules),
         }
 
     rule = matches[0]
@@ -375,6 +416,7 @@ def match_alert_to_ground_truth(alert: dict, rules: list[dict]) -> dict:
         "rationale": rule["rationale"],
         "validation_basis": rule.get("validation_basis", ""),
         "source_ref": rule.get("source_ref", ""),
+        "version_match_basis": target_version_match_basis(rule, alert),
     }
 
 
@@ -531,6 +573,7 @@ def build_match_audit(base_records: list[dict], rules: list[dict]) -> pd.DataFra
             "rationale": match["rationale"],
             "validation_basis": match.get("validation_basis", ""),
             "source_ref": match.get("source_ref", ""),
+            "version_match_basis": match.get("version_match_basis", ""),
             "plugin_id": record.get("plugin_id", record.get("pluginid", "")),
             "request_method": record.get("request_method", ""),
             "param": record.get("param", ""),
