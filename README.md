@@ -219,7 +219,7 @@ Only after `pipeline_results.json` is written does the evaluator use `ground_tru
 
 Alerts with no validated rule remain in `unmapped_alerts.json` and the match audit, but are not assumed safe. Candidate and supporting-only validation-overlay matches are retained as provisional audit evidence and excluded from primary metrics.
 
-Each run produces the scan report, raw alerts, clusters, pipeline results, parse diagnostics, rule audit, unmapped-alert audit, evaluation summary, classification metrics, calibration bins, and statistical output in the same run directory. `evaluation_protocol.json` records the `semantic-v1` scoring contract and a fingerprint over its policy, taxonomy, match rules, and validation overlay. Juice Shop and OWASP VulnerableApp are evaluated separately.
+Each run produces the scan report, raw alerts, clusters, pipeline results, parse diagnostics, rule audit, unmapped-alert audit, evaluation summary, classification metrics, calibration bins, and statistical output in the same run directory. `evaluation_protocol.json` records the `semantic-v2` scoring contract and a fingerprint over its policy, taxonomy, match rules, validation overlay, and label-universe policy. Juice Shop and OWASP VulnerableApp are evaluated separately.
 
 The primary outcome is semantic exact match: `SAFE` or canonical
 `vulnerability_family|CWE`. Exact taxonomy aliases are accepted; fuzzy and substring
@@ -229,6 +229,18 @@ per-label results, and paired tests over semantic correctness. The former Boolea
 verdict analysis is retained explicitly in
 `boolean_verdict_evaluation_results.csv` and
 `boolean_verdict_statistical_results.csv`.
+
+Semantic macro F1 uses one ordered label universe per application, constructed once
+from the run's validated mapped ground truths and shared by every strategy and by the
+operational and initial-only populations: `SAFE`, sorted canonical positive labels,
+then `OTHER_POSITIVE`. Confirmed diagnoses outside the canonical positive universe map
+to `OTHER_POSITIVE` only for classification reporting; their raw semantic labels and
+error reasons remain in `triage_results.csv`. All labels are always included in the
+macro average with `zero_division=0`. Consequently, when an application has only
+`SAFE` and one canonical positive ground-truth label, even a perfect classifier has a
+macro-F1 ceiling of `2/3` because `OTHER_POSITIVE` has zero ground-truth support. This
+deliberate `semantic-v2` convention makes strategies comparable within an evaluation,
+but its macro-F1 values must not be compared directly with `semantic-v1` artifacts.
 
 Operational metrics use every final parsed assessment. The evaluator also writes
 `initial_only_evaluation_results.csv`, `initial_only_statistical_results.csv`, and
@@ -270,6 +282,19 @@ and this policy is covered by the evaluation-protocol fingerprint.
 If no validated positive rule matches, or parse quality is below the configured threshold, the run still completes and writes all audit artefacts with an explicit insufficient-evidence status. It does not manufacture invalid F1 or statistical results.
 
 CVSS exploitability estimates are currently descriptive only. CVSS-MAE and anonymised-target experiments are deferred research extensions.
+
+Completed saved assessments can be re-evaluated without ZAP or LLM inference while
+leaving the source run unchanged:
+
+```bash
+python -B reevaluate_results.py \
+  --source-run results/runs/run_20260817T124003Z \
+  --output-dir results/evaluations/run_20260817T124003Z_semantic-v2
+```
+
+The destination must not already exist. `evaluation_derivation.json` records the source
+run, source-artifact hashes, derived evaluation protocol, and the no-network execution
+contract.
 
 ## Stop The Lab Services
 
