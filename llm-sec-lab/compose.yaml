@@ -5,32 +5,29 @@ networks:
 services:
 
   juice-shop:
-    image: bkimminich/juice-shop
+    image: ${JUICE_SHOP_IMAGE:?Run python -B run_pipeline.py --capture-environment-lock first}
     container_name: juice-shop
+    restart: unless-stopped
+    environment:
+      NODE_OPTIONS: --max-old-space-size=4096
     ports:
       - "3000:3000"
     networks:
       - lab-net
 
-  dvwa:
-    image: vulnerables/web-dvwa
-    container_name: dvwa
+  vulnerable-app:
+    image: ${VULNERABLE_APP_IMAGE:?Run python -B run_pipeline.py --capture-environment-lock first}
+    container_name: vulnerable-app
     ports:
-      - "8081:80"
-    networks:
-      - lab-net
-
-  webgoat:
-    image: webgoat/webgoat
-    container_name: webgoat
-    ports:
-      - "8080:8080"
+      - "9090:9090"
     networks:
       - lab-net
 
   zap:
-    image: ghcr.io/zaproxy/zaproxy:stable
+    image: ${ZAP_IMAGE:?Run python -B run_pipeline.py --capture-environment-lock first}
     container_name: zap
+    environment:
+      ZAP_PORT: "8090"
     ports:
       - "8090:8090"
     networks:
@@ -44,5 +41,4 @@ services:
       -config api.addrs.addr.regex=true
     depends_on:
       - juice-shop
-      - dvwa
-      - webgoat
+      - vulnerable-app
