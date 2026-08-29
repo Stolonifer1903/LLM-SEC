@@ -1,18 +1,8 @@
-# Discovery runtime (caches, logs, transient state)
-.discovery/logs/
-.discovery/runtime/
-.discovery/sessions/
-.discovery/toolcatalog/
-.discovery/host-tools/
-.discovery/bookshelf/*/extracted_content/
-.discovery/bookshelf/providers/
+# Local configuration and environments
 .env
 pinned-images.env
 .venv/
-llm-sec-lab/.venv/
 llm-sec-env/
-.tmp-pycache/
-.firecrawl/
 
 # Python caches
 __pycache__/
@@ -20,19 +10,4 @@ __pycache__/
 *$py.class
 
 # Generated lab outputs
-llm-sec-lab/results/
-zap_alerts.json
-evaluation_results.csv
-evaluation_results_*.csv
-pipeline_results.json
-pipeline_results_*.json
-ground_truth_match_audit.csv
-ground_truth_match_audit_*.csv
-statistical_results.csv
-statistical_results_*.csv
-evaluation_summary.json
-evaluation_summary_*.json
-unmapped_alerts.json
-unmapped_alerts_*.json
-
-VulnerableApp-master/
+results/

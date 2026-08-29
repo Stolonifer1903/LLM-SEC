@@ -1,22 +1,24 @@
 # LLM Security Triage Lab
 
-This repository contains a small research workspace for evaluating whether LLMs can help triage Dynamic Application Security Testing (DAST) findings from OWASP ZAP. It combines vulnerable web applications, a ZAP scanner runner, LLM prompt strategies, ground-truth labels, and research notes.
+This repository contains a reproducible research lab for evaluating whether LLMs can help triage Dynamic Application Security Testing (DAST) findings from OWASP ZAP. It combines vulnerable web applications, a ZAP scanner runner, three LLM prompt strategies, source-bound ground-truth rules, and deterministic post-hoc evaluation.
 
 ## Repository Layout
 
 - `llm-sec-lab/` - Runnable security triage lab.
   - `compose.yaml` - Docker Compose stack for OWASP Juice Shop, OWASP VulnerableApp, and OWASP ZAP.
-  - `zap_scanner.py` - Runs scoped DAST workflows: traditional discovery, AJAX discovery for Juice Shop, baseline or targeted active rules, coverage validation, and report generation.
   - `run_pipeline.py` - CLI entry point for the automated post-triage research workflow.
   - `research_pipeline.py` - Scans, deduplicates, triages every alert, then applies deterministic rules after inference.
+  - `zap_scanner.py` - Runs scoped discovery, request seeding, active scanning, coverage validation, and report generation.
   - `evaluator.py` - Retained for catalogue and validation-overlay utilities; it is never consulted during triage.
-  - `ground_truth.csv` - Expected vulnerability labels used by the evaluator.
-  - `ground_truth_detection_validation.csv` - Review overlay that records whether catalogue challenges have been reproducibly validated as ZAP-detectable.
+  - `environment_lock.py` - Captures and verifies immutable container, application, catalogue, and ZAP add-on metadata.
+  - `reevaluate_results.py` - Re-evaluates completed saved assessments without rescanning or making LLM calls.
+  - `verify_rule_provenance.py` - Replays a bounded allow-list of paired VulnerableApp payloads and controls.
+  - `ground_truth*.csv` and `semantic_taxonomy.json` - Source-bound labels, validation evidence, match rules, and semantic scoring taxonomy.
+  - `tests/` - Unit tests for the scanner, pipeline, provenance, and evaluation contracts.
+  - `MODELS.md` - Model registry and experiment compatibility notes.
   - `requirements.txt` - Python dependencies for the lab runner.
-- `knowledge/` - Research papers, notes, draft material, and a wiki for the LLM triage project.
-- `.discovery/` and `.github/` - Workspace metadata, agent guidance, task state, and Copilot/Discovery configuration.
 
-Generated files such as `.env`, immutable `results/` corpus/experiment artifacts, virtual environments, bytecode caches, and Discovery runtime indexes are ignored by Git.
+Local secrets, generated `results/`, virtual environments, and bytecode caches are ignored by Git.
 
 ## Prerequisites
 
@@ -32,14 +34,14 @@ The vulnerable apps are intentionally insecure. Run this stack locally for lab u
 ## Clone The Repository
 
 ```bash
-git clone <repo-url>
-cd "<repo-folder>"
+git clone https://github.com/Stolonifer1903/LLM-SEC.git
+cd LLM-SEC
 ```
 
 On Windows PowerShell, paths with spaces need quotes:
 
 ```powershell
-cd "D:\WebDev\New folder"
+cd "D:\path\to\LLM-SEC"
 ```
 
 ## Set Up Python
@@ -68,7 +70,13 @@ python -m pip install -r requirements.txt
 
 ## Configure The API Key
 
-Create `llm-sec-lab/.env`:
+Copy the provided template to `llm-sec-lab/.env`:
+
+```bash
+cp .env.example .env
+```
+
+On PowerShell, use `Copy-Item .env.example .env`. Then set your API key:
 
 ```text
 NVIDIA_API_KEY=your_api_key_here
@@ -76,13 +84,15 @@ NVIDIA_API_KEY=your_api_key_here
 
 The file is ignored by Git.
 
-The default model is configured in `llm-sec-lab/research_pipeline.py`:
+The default model is `meta/llama-3.1-8b-instruct`. Override it in `.env` when required:
 
-```python
-MODEL = "meta/llama-3.1-8b-instruct"
+```text
+NIM_MODEL=meta/llama-3.1-8b-instruct
+# Optional for another OpenAI-compatible NIM endpoint:
+# NIM_BASE_URL=https://integrate.api.nvidia.com/v1
 ```
 
-Change that value if your NVIDIA endpoint uses a different model name.
+For a one-off run, pass `--model <model-id>` instead. Record model changes as separate experimental conditions; see `MODELS.md`.
 
 ## Start The Lab Services
 
@@ -129,6 +139,17 @@ To assess only ZAP against the webapps before adding or updating ground truth, r
 python run_pipeline.py --scan-only --scan-profile targeted
 ```
 
+The scan profiles are `baseline`, `targeted`, `benchmark`, and `final`. The
+`benchmark` profile is the broad Pen Test policy. It is distinct from the
+VulnerableApp-only official comparator action:
+
+```bash
+python -B run_pipeline.py --benchmark --scan-profile benchmark
+```
+
+The comparator action scans only VulnerableApp and submits the resulting alert set to
+its official `/scanner/benchmark` endpoint.
+
 ### Final reproducible scan workflow
 
 Configure a dedicated local Juice Shop test account in `.env`; neither value is
@@ -166,11 +187,15 @@ audit but never enter final metrics.
 
 This writes the raw alerts and `zap_scan_report.json` under `results/runs/<run_id>/` and makes no NIM/LLM calls. Console output reports ZAP readiness, each target, per-target alert counts, and the artifact directory.
 
-To triage a completed scan without contacting ZAP again, pass its run directory:
+To triage a completed targeted scan without contacting ZAP again, pass its run
+directory:
 
 ```bash
-python run_pipeline.py --reuse-from results/runs/<scan_run_id> --scan-profile benchmark
+python run_pipeline.py --reuse-from results/runs/<scan_run_id> --scan-profile targeted
 ```
+
+Use the same profile recorded by the source scan. A final scan must be reused with
+`--scan-profile final`; do not relabel one scan corpus as another profile.
 
 During LLM triage, each completed `(prompt_strategy, cluster_id)` assessment is appended to one `triage_checkpoint.jsonl` file and progress metadata is atomically updated in `triage_checkpoint_state.json`. A transient API disconnect is retried with bounded exponential backoff. If the process still exits before triage finishes, resume the same result directory in place:
 
@@ -262,7 +287,7 @@ VulnerableApp rule provenance can be refreshed without scanning or route discove
 
 ```bash
 python -B verify_rule_provenance.py \
-  --run-dir results/runs/run_20260813T124614Z \
+  --run-dir results/runs/<eligible_run_id> \
   --environment-lock environment-lock.json
 ```
 
@@ -288,8 +313,8 @@ leaving the source run unchanged:
 
 ```bash
 python -B reevaluate_results.py \
-  --source-run results/runs/run_20260817T124003Z \
-  --output-dir results/evaluations/run_20260817T124003Z_semantic-v2
+  --source-run results/runs/<completed_run_id> \
+  --output-dir results/evaluations/<completed_run_id>_semantic-v2
 ```
 
 The destination must not already exist. `evaluation_derivation.json` records the source
@@ -310,7 +335,7 @@ If you want to remove downloaded container data and images, use Docker Desktop o
 
 - `NVIDIA_API_KEY` missing: confirm `llm-sec-lab/.env` exists and that you run the Python command from `llm-sec-lab/`.
 - Docker cannot pull images: confirm Docker is running and the machine has internet access.
-- ZAP does not respond: run `docker compose ps` and inspect logs with `docker compose logs zap`.
+- ZAP does not respond: run `docker compose --env-file pinned-images.env ps` and inspect logs with `docker compose --env-file pinned-images.env logs zap`.
 - VulnerableApp/Juice Shop unavailable from the browser: check the local port mappings in `compose.yaml`.
 - A completed run with `completed_with_warnings` reached one or more stage limits but still finalized both targets. Inspect `scan_status.json` and `zap_scan_report.json` before interpreting coverage.
 - A `partial_failed` or `interrupted` run is audit/recovery evidence only. It has no aggregate `raw_alerts.json` and is deliberately excluded from automatic reuse.
@@ -323,3 +348,11 @@ If you want to remove downloaded container data and images, use Docker Desktop o
 3. Inspect the immutable artefacts under `results/runs/<run_id>/`.
 4. Add only version-controlled validated rules when new defensible alert-to-challenge evidence is available; do not edit runtime outputs to assign labels.
 5. Shut down services with `docker compose --env-file pinned-images.env down`.
+
+## Run the Tests
+
+From `llm-sec-lab/` with the virtual environment activated:
+
+```bash
+python -B -m unittest discover -s tests -q
+```
